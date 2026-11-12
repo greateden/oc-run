@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -137,7 +138,7 @@ class RunnerTests(unittest.TestCase):
     def test_worker_survives_unavailable_native_inbox(self):
         code, output, run, state = self.run_fake('supervisor_unavailable')
         self.assertEqual(code, 0, output)
-        self.assertIn('steering_unconfirmed', (run / 'journal.jsonl').read_text())
+        self.assertIn('steering_uncertain', (run / 'journal.jsonl').read_text())
         self.assertTrue((self.project / 'answer.txt').exists())
 
     def test_premature_completion_is_unverified(self):
@@ -394,16 +395,259 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('UNVERIFIED final candidate', output)
         self.assertEqual(before, {p.name: p.read_bytes() for p in run.iterdir()})
 
-    def test_long_handoff_excerpts_keep_full_state(self):
+    def test_long_handoff_excerpts_keep_full_evidence(self):
         _, _, run, state = self.run_fake()
         long = 'x' * 30000
         oc.atomic_write(run / 'task.txt', long)
         state.update(last_work=long, incidents=[long])
         state['review'].update(summary=long, next=long, evidence=[long])
+        oc.incident(run, state, long)
+        oc.atomic_write(run / '0001-work.md', long)
         oc.save(run, state)
         self.assertLess(len((run / 'HANDOFF.md').read_text()), 16000)
         self.assertEqual((run / 'task.txt').read_text(), long)
-        self.assertEqual(json.loads((run / 'run.json').read_text())['incidents'], [long])
+        self.assertLess((run / 'run.json').stat().st_size, 16000)
+        self.assertIn(long, (run / 'journal.jsonl').read_text())
+        self.assertEqual((run / '0001-work.md').read_text(), long)
+
+    def test_oversized_state_remains_stoppable_and_recoverable(self):
+        proc = self.launch('crash', '1h', 'test')
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        child = int(self.wait_file('child.pid').read_text())
+        run = next(p for p in self.state.iterdir() if p.is_dir())
+        until = time.monotonic() + 2
+        while oc.load_state(run)['session'] is None and time.monotonic() < until:
+            time.sleep(.03)
+        state = oc.load_state(run)
+        state.pop('compact_state', None)  # simulate a pre-upgrade snapshot
+        state['last_work'] = 'retained old output ' * 70000
+        old = json.dumps(state)
+        oc.atomic_write(run / 'run.json', old)
+        self.assertGreater((run / 'run.json').stat().st_size, 1024 * 1024)
+        for args in [('status',), ('stop', '--latest')]:
+            command = self.launch('success', *args)
+            output, _ = command.communicate(timeout=2)
+            self.assertEqual(command.returncode, 0, output)
+        proc.kill(); proc.communicate(timeout=10)
+        self.assert_gone(child); self.wait_inactive(run)
+        # The runner may already have compacted at the stop boundary.
+        if not (run / 'legacy-state.json').exists():
+            oc.atomic_write(run / 'run.json', old)
+        code, output, _, state = self.run_fake('success', 'resume', '5s', '--latest')
+        self.assertEqual(code, 0, output)
+        self.assertEqual((run / 'legacy-state.json').read_text(), old)
+        self.assertLess((run / 'run.json').stat().st_size, 64000)
+
+    def test_growing_overnight_journal_keeps_control_state_small(self):
+        _, _, run, state = self.run_fake()
+        for i in range(1200):
+            oc.incident(run, state, str(i) + ': ' + 'x' * 1200)
+            if i % 100 == 0:
+                oc.save(run, state)
+                self.assertLess((run / 'run.json').stat().st_size, 64000)
+        oc.save(run, state)
+        self.assertGreater((run / 'journal.jsonl').stat().st_size, 1024 * 1024)
+        self.assertEqual(len(state['incidents']), 12)
+        self.assertEqual(oc.load_state(run)['session'], 'ses_fixture')
+        self.assertEqual(len([x for x in (run / 'journal.jsonl').read_text().splitlines()
+                              if json.loads(x)['kind'] == 'incident']), 1200)
+        # A growing journal must not affect the control command's read path.
+        live = self.launch('stall', '1h', 'overnight fixture')
+        child = int(self.wait_file('child.pid').read_text())
+        live_run = next(p for p in self.state.iterdir() if p.is_dir() and p != run)
+        with (live_run / 'journal.jsonl').open('ab') as handle:
+            handle.write((run / 'journal.jsonl').read_bytes())
+        stop = self.launch('success', 'stop', '--latest')
+        output, _ = stop.communicate(timeout=2)
+        self.assertEqual(stop.returncode, 0, output)
+        self.assertTrue((live_run / 'stop.json').exists())
+        live.terminate(); live.communicate(timeout=10); self.assert_gone(child)
+
+    def test_corrupt_or_symlink_state_has_clear_error(self):
+        run = self.base / 'bad'; run.mkdir()
+        for text in ('{bad', 'null', '[]', '{}'):
+            (run / 'run.json').write_text(text)
+            with self.assertRaisesRegex(ValueError, 'cannot read state'):
+                oc.load_state(run)
+        (run / 'run.json').unlink()
+        (run / 'run.json').symlink_to(self.base / 'target')
+        with self.assertRaisesRegex(ValueError, 'cannot read state'):
+            oc.load_state(run)
+
+    def test_malformed_nested_events_do_not_hide_later_valid_events(self):
+        bad = [{'type': 'tool_use', 'part': value} for value in ([], 'oops', 42)]
+        for keys in [('state',), ('state', 'metadata'), ('state', 'metadata', 'metadata')]:
+            for value in ([], 'oops', 42, True):
+                event = {'type': 'tool_use', 'part': {}}
+                parent = event['part']
+                for key in keys[:-1]:
+                    parent[key] = {}; parent = parent[key]
+                parent[keys[-1]] = value
+                bad.append(event)
+        bad += [{'type': 'text', 'part': {'text': None}}, {'type': 'tool_use', 'part': {'id': []}}]
+        valid = [{'type': 'step_start', 'part': None}, {'type': 'tool_use'},
+                 {'type': 'tool_use', 'part': {'id': 'ok', 'tool': 'read', 'state': {
+                     'status': 'completed', 'metadata': None, 'output': 'useful'}}},
+                 {'type': 'text', 'part': {'text': 'after malformed'}}]
+        path = self.base / 'events.jsonl'
+        raw = ''.join(json.dumps(x) + '\n' for x in bad + valid)
+        path.write_text(raw)
+        facts = oc.events(path)
+        self.assertEqual(len(facts['diagnostics']), len(bad))
+        self.assertEqual(len(facts['successes']), 1)
+        self.assertEqual(facts['text'], 'after malformed')
+        self.assertEqual(path.read_text(), raw)
+        code, output, run, state = self.run_fake('bad_events')
+        self.assertEqual(code, 0, output)
+        self.assertEqual(state['successful_tools'], 1)
+        self.assertIn('malformed_event', (run / 'journal.jsonl').read_text())
+        code, output, _, state = self.run_fake('bad_event_then_error')
+        self.assertEqual(code, 1, output)
+        self.assertEqual(state['status'], 'failed')
+        self.assertIn('real fatal error', str(state['incidents']))
+
+    def test_latest_control_does_not_cross_projects(self):
+        proc = self.launch('stall', '1h', 'first project')
+        child = int(self.wait_file('child.pid').read_text())
+        first = next(p for p in self.state.iterdir() if p.is_dir())
+        other = self.base / 'other'; other.mkdir()
+        for args in [('status',), ('stop', '--latest'), ('resume', '1s', '--latest')]:
+            result = subprocess.run([sys.executable, str(ROOT / 'oc-run'), *args], cwd=other,
+                                    env=self.env, capture_output=True, text=True, timeout=2)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn('current project', result.stderr)
+        self.assertFalse((first / 'stop.json').exists())
+        second = subprocess.Popen([sys.executable, str(ROOT / 'oc-run'), '1h', 'second'], cwd=other,
+                    env={**self.env, 'FAKE_SCENARIO': 'stall'}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        until = time.monotonic() + 4
+        while not (other / 'child.pid').exists() and time.monotonic() < until:
+            time.sleep(.03)
+        other_child = int((other / 'child.pid').read_text())
+        stop = self.launch('success', 'stop', '--latest')
+        output, _ = stop.communicate(timeout=2)
+        self.assertEqual(stop.returncode, 0, output)
+        self.assertTrue((first / 'stop.json').exists())
+        second_run = next(p for p in self.state.iterdir() if p.is_dir() and p != first)
+        self.assertFalse((second_run / 'stop.json').exists())
+        explicit = subprocess.run([sys.executable, str(ROOT / 'oc-run'), 'status', '--run', str(first)],
+                                  cwd=other, env=self.env, capture_output=True, text=True, timeout=2)
+        self.assertEqual(explicit.returncode, 0, explicit.stdout + explicit.stderr)
+        for process in (proc, second):
+            process.terminate(); process.communicate(timeout=10)
+        self.assert_gone(child); self.assert_gone(other_child)
+
+    def test_guardian_cleans_descendant_after_immediate_child_exits(self):
+        reader, writer = os.pipe()
+        path = self.base / 'descendant.pid'
+        script = ("import subprocess,sys;from pathlib import Path;"
+                  "p=subprocess.Popen([sys.executable,'-c',"
+                  "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(120)']);"
+                  "Path(sys.argv[1]).write_text(str(p.pid))")
+        proc = subprocess.Popen([sys.executable, str(ROOT / 'oc-run'), '_child', str(reader),
+                                 sys.executable, '-c', script, str(path)], pass_fds=(reader,), start_new_session=True)
+        os.close(reader)
+        try:
+            self.assertEqual(proc.wait(timeout=6), 0)
+            self.assert_gone(int(path.read_text()))
+        finally:
+            os.close(writer)
+
+    def test_stop_delivery_reconciles_before_retry_and_reports_unknown(self):
+        _, _, run, state = self.run_fake()
+        for failure in (OSError('connection dropped'), urllib.error.HTTPError('fixture', 503, 'busy', {}, None)):
+            with self.subTest(failure=failure):
+                delivery = {'id': 'msg_stop', 'status': 'pending'}
+                state['stop_delivery'] = delivery
+                server = mock.Mock()
+                server.request.side_effect = [failure, {'data': []},
+                    urllib.error.HTTPError('fixture', 404, 'absent', {}, None), {'data': {'id': 'msg_stop'}}]
+                oc.steer(server, run, state, oc.STOP, delivery)
+                self.assertEqual(delivery['status'], 'uncertain')
+                oc.steer(server, run, state, oc.STOP, delivery)
+                self.assertEqual(delivery['status'], 'confirmed')
+                paths = [x.args[0] for x in server.request.call_args_list]
+                self.assertTrue(paths[1].endswith('/inbox'))
+                self.assertTrue(paths[2].endswith('/message/msg_stop'))
+                self.assertEqual(server.request.call_args_list[0].args[1]['id'],
+                                 server.request.call_args_list[-1].args[1]['id'])
+        for receipt in ({'data': None}, {'data': {'id': 'different'}}, {}):
+            delivery = {'id': 'msg_unknown', 'status': 'pending'}
+            state['stop_delivery'] = delivery
+            server = mock.Mock()
+            server.request.side_effect = [receipt, OSError('inbox offline')]
+            oc.steer(server, run, state, oc.STOP, delivery)
+            self.assertEqual(oc.load_state(run)['stop_delivery']['status'], 'uncertain')
+            oc.steer(server, run, state, oc.STOP, delivery)
+            self.assertEqual(server.request.call_count, 2)  # one POST, one GET; no blind resend
+            server.request.side_effect = None
+            server.request.return_value = {'data': [{'id': 'msg_unknown'}]}
+            oc.steer(server, run, state, oc.STOP, delivery)
+            self.assertEqual(delivery['status'], 'confirmed')
+        delivery = {'id': 'msg_promoted', 'status': 'uncertain'}
+        state['stop_delivery'] = delivery
+        server = mock.Mock()
+        server.request.side_effect = [{'data': []}, {'data': {'id': 'msg_promoted'}}]
+        oc.steer(server, run, state, oc.STOP, delivery)
+        self.assertEqual(delivery['status'], 'confirmed')
+        self.assertEqual(server.request.call_count, 2)  # promotion is acceptance, not an absent inbox
+        delivery = {'id': 'msg_rejected', 'status': 'pending'}
+        state['stop_delivery'] = delivery
+        server = mock.Mock()
+        server.request.side_effect = urllib.error.HTTPError('fixture', 403, 'denied', {}, None)
+        oc.steer(server, run, state, oc.STOP, delivery)
+        oc.steer(server, run, state, oc.STOP, delivery)
+        self.assertEqual(delivery['status'], 'rejected')
+        self.assertEqual(server.request.call_count, 1)
+
+    def test_stop_transport_failure_recovers_without_duplicate_admission(self):
+        for scenario, attempts, expected in [('stop_recovery', 2, 'confirmed'),
+                                             ('stop_unknown_ack', 1, 'confirmed'),
+                                             ('stop_rejected', 1, 'rejected')]:
+            with self.subTest(scenario=scenario):
+                notifications = self.project / 'notifications.jsonl'
+                if notifications.exists():
+                    notifications.unlink()
+                code, output, run, state = self.run_fake(scenario, '0.2s', 'fixture')
+                self.assertEqual(code, 3, output)
+                self.assertEqual(state['stop_delivery']['status'], expected)
+                messages = [json.loads(x) for x in notifications.read_text().splitlines()]
+                self.assertEqual(len(messages), attempts)
+                self.assertEqual(len({x['id'] for x in messages}), 1)
+                self.assertTrue((self.project / 'action-finished').exists())
+                self.assertFalse((run / 'force.json').exists())
+
+    def test_completion_is_reported_not_independently_verified(self):
+        for scenario in ('incomplete', 'no_evidence'):
+            code, output, run, state = self.run_fake(scenario)
+            self.assertEqual(code, 3, output)
+            self.assertEqual(state['status'], 'incomplete')
+            self.assertGreater(state['successful_tools'], 0)
+        code, output, run, state = self.run_fake()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(state['status'], 'reported-complete')
+        self.assertIn('Independent acceptance checks: not run', (run / 'HANDOFF.md').read_text())
+        proc = self.launch('success', '5s', '--stop-when-done', 'unused')
+        output, _ = proc.communicate(timeout=2)
+        self.assertEqual(proc.returncode, 2, output)
+        self.assertIn('unrecognized arguments', output)
+
+    def test_unknown_stop_survives_runner_crash(self):
+        proc = self.launch('stop_offline', '1h', 'test')
+        child = int(self.wait_file('child.pid').read_text())
+        run = next(p for p in self.state.iterdir() if p.is_dir())
+        stop = self.launch('success', 'stop', '--latest')
+        output, _ = stop.communicate(timeout=2)
+        self.assertEqual(stop.returncode, 0, output)
+        until = time.monotonic() + 3
+        while oc.load_state(run).get('stop_delivery', {}).get('status') != 'uncertain' and time.monotonic() < until:
+            time.sleep(.03)
+        proc.kill(); proc.communicate(timeout=8)
+        self.assert_gone(child); self.wait_inactive(run)
+        state = oc.load_state(run)
+        self.assertEqual(state['stop_delivery']['status'], 'uncertain', output)
+        self.assertEqual(json.loads((run / 'stop.json').read_text())['execution'], state['execution'])
+        self.assertIn('steering_uncertain', (run / 'journal.jsonl').read_text())
+        self.assertTrue((run / 'CONTROL.md').read_text().startswith('STOP'))
 
 
 if __name__ == "__main__":
