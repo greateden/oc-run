@@ -57,6 +57,7 @@ oc-run handoff --run /path/to/run
 - The terminal prints the run directory and runner PID.
 - `HANDOFF.md` holds the task, directory, recorded elapsed time, last useful work,
   model review, Git changes, failures, unverified claims and next action.
+- Long sections are shown as excerpts. Full task text and replies stay in the run directory.
 - `run.json` holds controller state. Each invocation has a raw JSONL log and reply.
 - Handoff commands read local files. They make no model call and do not upload anything.
 - State is private to your account under `~/.local/state/oc-run`.

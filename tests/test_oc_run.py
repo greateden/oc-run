@@ -252,13 +252,26 @@ class RunnerTests(unittest.TestCase):
         run.mkdir(mode=0o700)
         (run / 'STATE.md').write_text('Old model claim')
         (run / 'RESULT.txt').write_text('SAFETY_TIMEOUT; finalisation=failed; exit=124')
+        (run / 'final.log.unverified-state').write_text('Useful but unverified final candidate')
         before = {p.name: p.read_bytes() for p in run.iterdir()}
         proc = self.launch('stall', 'handoff', '--latest')
         output, _ = proc.communicate(timeout=5)
         self.assertEqual(proc.returncode, 0, output)
         self.assertIn('completion unverified', output)
         self.assertIn('exit=124', output)
+        self.assertIn('UNVERIFIED final candidate', output)
         self.assertEqual(before, {p.name: p.read_bytes() for p in run.iterdir()})
+
+    def test_long_handoff_excerpts_keep_full_state(self):
+        _, _, run, state = self.run_fake()
+        long = 'x' * 30000
+        oc.atomic_write(run / 'task.txt', long)
+        state.update(last_work=long, incidents=[long])
+        state['review'].update(summary=long, next=long, evidence=[long])
+        oc.save(run, state)
+        self.assertLess(len((run / 'HANDOFF.md').read_text()), 16000)
+        self.assertEqual((run / 'task.txt').read_text(), long)
+        self.assertEqual(json.loads((run / 'run.json').read_text())['incidents'], [long])
 
 
 if __name__ == "__main__":

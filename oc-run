@@ -189,25 +189,29 @@ def review_report(text):
     return report
 
 
+def excerpt(text, limit=2000):
+    return text if len(text) <= limit else text[:limit] + "\n[Excerpt; full text remains in the run directory.]"
+
+
 def handoff(run, state):
     report = state.get("review") or {}
     parts = ["# OC Run handoff", f"Status: {state['status']}. {state.get('reason', '')}",
              f"Directory: {state['cwd']}\nElapsed: {state['elapsed']:.1f}s (target {state['budget']:.1f}s).",
-             "## Original task\n\n" + read(run / "task.txt"),
+             "## Original task (full text in task.txt)\n\n" + excerpt(read(run / "task.txt"), 800),
              "## Last useful state (model report; verify claims)\n\n" +
-             (state.get("last_work") or "No work reply recorded.") +
-             "\n\nLast review:\n" + report.get("summary", "No model review recorded."),
+             excerpt(state.get("last_work") or "No work reply recorded.") +
+             "\n\nLast review:\n" + excerpt(report.get("summary", "No model review recorded.")),
              "## Evidence cited by the model\n\n" +
-             ("\n".join("- " + x for x in report.get("evidence", [])) or "None recorded."),
+             excerpt("\n".join("- " + x for x in report.get("evidence", [])) or "None recorded."),
              "## Failed or interrupted operations\n\n" +
-             ("\n".join("- " + x for x in state.get("incidents", [])) or "None recorded."),
-             "## File changes\n\nBefore:\n" + state['git_before']['changes'] +
-             "\n\nLast observed:\n" + state.get('git_after', state['git_before'])['changes'],
+             excerpt("\n".join("- " + x for x in state.get("incidents", [])) or "None recorded."),
+             "## File changes\n\nBefore:\n" + excerpt(state['git_before']['changes'], 1000) +
+             "\n\nLast observed:\n" + excerpt(state.get('git_after', state['git_before'])['changes'], 1000),
              "## Unverified\n\nCompletion is a model review, not independent proof. "
              "Successful tool exits do not prove the results. See raw logs for full details. "
              "Failures remain historical unless the review explains recovery. "
              "After interruption, inspect partial output and running jobs before repeating work.",
-             "## Next action\n\n" + report.get("next", "Inspect logs and project state, then resume if useful."),
+             "## Next action\n\n" + excerpt(report.get("next", "Inspect logs and project state, then resume if useful.")),
              f"Local logs: {run}\nSession: {state.get('session') or 'not recorded'}"]
     return "\n\n".join(parts) + "\n"
 
@@ -454,7 +458,11 @@ def main(argv=None):
             # Historical reports are read-only. Never promote their rejected checkpoints.
             print("Legacy run: completion unverified. Inspect raw logs and validation records.\n")
             print(read(run / 'RESULT.txt'))
-            print(read(run / 'STATE.md'))
+            print(excerpt(read(run / 'STATE.md')))
+            candidate = read(run / 'final.log.unverified-state')
+            if candidate:
+                print("\nUNVERIFIED final candidate excerpt (not accepted by the old controller):\n")
+                print(candidate[-4000:])
             print(f"Full state and unverified candidates: {run}")
         return 0
     binary = os.environ.get('OC_RUN_BIN') or shutil.which('opencode')
