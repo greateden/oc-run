@@ -12,16 +12,19 @@ import time
 
 scenario = os.environ.get("FAKE_SCENARIO", "success")
 if len(sys.argv) > 1 and sys.argv[1] == 'serve':
+    inbox, attempts = {}, 0
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_): pass
         def do_GET(self):
             data = {'id': 'ses_fixture'}
             if self.path.endswith('/inbox'):
-                data = []
+                data = list(inbox.values())
                 if scenario == 'stale_control':
                     run = next(p for p in Path(os.environ['OC_RUN_STATE_DIR']).iterdir() if p.is_dir())
                     prefix = 'msg_ocrun_' + hashlib.sha256(os.fsencode(run)).hexdigest()[:12] + '_'
                     data = [{'id': prefix + 'old'}, {'id': 'msg_unrelated'}]
+            elif '/message/' in self.path:
+                self.send_response(404); self.end_headers(); return
             self.send_response(200); self.end_headers()
             self.wfile.write(json.dumps({'data': data}).encode())
         def do_DELETE(self):
@@ -29,11 +32,19 @@ if len(sys.argv) > 1 and sys.argv[1] == 'serve':
                 out.write(self.path + '\n')
             self.send_response(204); self.end_headers()
         def do_POST(self):
+            global attempts
+            attempts += 1
             message = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             with Path('notifications.jsonl').open('a') as out:
                 out.write(json.dumps(message) + '\n')
-            if scenario == 'supervisor_unavailable':
+            if scenario in ('supervisor_unavailable', 'stop_offline') or (scenario == 'stop_recovery' and attempts == 1):
                 self.send_response(503); self.end_headers(); return
+            if scenario == 'stop_rejected':
+                self.send_response(403); self.end_headers(); return
+            inbox[message['id']] = message
+            if scenario == 'stop_unknown_ack':
+                self.close_connection = True
+                return
             self.send_response(200); self.end_headers()
             self.wfile.write(json.dumps({'data': {'id': message['id']}}).encode())
     server = HTTPServer(('127.0.0.1', 0), Handler)
@@ -69,7 +80,7 @@ if scenario == 'bad_events':
 if scenario == 'bad_event_then_error':
     emit('error', ['unexpected part'], error={'message': 'real fatal error'})
     sys.exit(0)
-if scenario in ("stall", "crash"):
+if scenario in ("stall", "crash", "stop_offline"):
     emit('tool_use', {'id': 'call_external', 'tool': 'shell', 'state': {
         'status': 'running', 'input': {'command': 'external non-idempotent action'}}})
     child = subprocess.Popen([sys.executable, "-c",
@@ -80,9 +91,9 @@ if scenario in ("stall", "crash"):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     while True:
         time.sleep(.1)
-if scenario in ('long', 'soft_stop'):
+if scenario in ('long', 'soft_stop', 'stop_recovery', 'stop_unknown_ack', 'stop_rejected'):
     Path('action-started').touch()
-    time.sleep(.8)
+    time.sleep(3 if scenario.startswith('stop_') else .8)
     Path('action-finished').touch()
 if scenario in ('repeat', 'supervisor_unavailable', 'changed', 'progress'):
     for i in range(6):

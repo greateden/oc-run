@@ -138,7 +138,7 @@ class RunnerTests(unittest.TestCase):
     def test_worker_survives_unavailable_native_inbox(self):
         code, output, run, state = self.run_fake('supervisor_unavailable')
         self.assertEqual(code, 0, output)
-        self.assertIn('steering_unconfirmed', (run / 'journal.jsonl').read_text())
+        self.assertIn('steering_uncertain', (run / 'journal.jsonl').read_text())
         self.assertTrue((self.project / 'answer.txt').exists())
 
     def test_premature_completion_is_unverified(self):
@@ -537,9 +537,88 @@ class RunnerTests(unittest.TestCase):
         self.assert_gone(child); self.assert_gone(other_child)
 
 
+    def test_stop_delivery_reconciles_before_retry_and_reports_unknown(self):
+        _, _, run, state = self.run_fake()
+        for failure in (OSError('connection dropped'), urllib.error.HTTPError('fixture', 503, 'busy', {}, None)):
+            with self.subTest(failure=failure):
+                delivery = {'id': 'msg_stop', 'status': 'pending'}
+                state['stop_delivery'] = delivery
+                server = mock.Mock()
+                server.request.side_effect = [failure, {'data': []},
+                    urllib.error.HTTPError('fixture', 404, 'absent', {}, None), {'data': {'id': 'msg_stop'}}]
+                oc.steer(server, run, state, oc.STOP, delivery)
+                self.assertEqual(delivery['status'], 'uncertain')
+                oc.steer(server, run, state, oc.STOP, delivery)
+                self.assertEqual(delivery['status'], 'confirmed')
+                paths = [x.args[0] for x in server.request.call_args_list]
+                self.assertTrue(paths[1].endswith('/inbox'))
+                self.assertTrue(paths[2].endswith('/message/msg_stop'))
+                self.assertEqual(server.request.call_args_list[0].args[1]['id'],
+                                 server.request.call_args_list[-1].args[1]['id'])
+        for receipt in ({'data': None}, {'data': {'id': 'different'}}, {}):
+            delivery = {'id': 'msg_unknown', 'status': 'pending'}
+            state['stop_delivery'] = delivery
+            server = mock.Mock()
+            server.request.side_effect = [receipt, OSError('inbox offline')]
+            oc.steer(server, run, state, oc.STOP, delivery)
+            self.assertEqual(oc.load_state(run)['stop_delivery']['status'], 'uncertain')
+            oc.steer(server, run, state, oc.STOP, delivery)
+            self.assertEqual(server.request.call_count, 2)  # one POST, one GET; no blind resend
+            server.request.side_effect = None
+            server.request.return_value = {'data': [{'id': 'msg_unknown'}]}
+            oc.steer(server, run, state, oc.STOP, delivery)
+            self.assertEqual(delivery['status'], 'confirmed')
+        delivery = {'id': 'msg_promoted', 'status': 'uncertain'}
+        state['stop_delivery'] = delivery
+        server = mock.Mock()
+        server.request.side_effect = [{'data': []}, {'data': {'id': 'msg_promoted'}}]
+        oc.steer(server, run, state, oc.STOP, delivery)
+        self.assertEqual(delivery['status'], 'confirmed')
+        self.assertEqual(server.request.call_count, 2)  # promotion is acceptance, not an absent inbox
+        delivery = {'id': 'msg_rejected', 'status': 'pending'}
+        state['stop_delivery'] = delivery
+        server = mock.Mock()
+        server.request.side_effect = urllib.error.HTTPError('fixture', 403, 'denied', {}, None)
+        oc.steer(server, run, state, oc.STOP, delivery)
+        oc.steer(server, run, state, oc.STOP, delivery)
+        self.assertEqual(delivery['status'], 'rejected')
+        self.assertEqual(server.request.call_count, 1)
+
+    def test_stop_transport_failure_recovers_without_duplicate_admission(self):
+        for scenario, attempts, expected in [('stop_recovery', 2, 'confirmed'),
+                                             ('stop_unknown_ack', 1, 'confirmed'),
+                                             ('stop_rejected', 1, 'rejected')]:
+            with self.subTest(scenario=scenario):
+                notifications = self.project / 'notifications.jsonl'
+                if notifications.exists():
+                    notifications.unlink()
+                code, output, run, state = self.run_fake(scenario, '0.2s', 'fixture')
+                self.assertEqual(code, 3, output)
+                self.assertEqual(state['stop_delivery']['status'], expected)
+                messages = [json.loads(x) for x in notifications.read_text().splitlines()]
+                self.assertEqual(len(messages), attempts)
+                self.assertEqual(len({x['id'] for x in messages}), 1)
+                self.assertTrue((self.project / 'action-finished').exists())
+                self.assertFalse((run / 'force.json').exists())
 
 
-
+    def test_unknown_stop_survives_runner_crash(self):
+        proc = self.launch('stop_offline', '1h', 'test')
+        child = int(self.wait_file('child.pid').read_text())
+        run = next(p for p in self.state.iterdir() if p.is_dir())
+        stop = self.launch('success', 'stop', '--latest')
+        output, _ = stop.communicate(timeout=2)
+        self.assertEqual(stop.returncode, 0, output)
+        until = time.monotonic() + 3
+        while oc.load_state(run).get('stop_delivery', {}).get('status') != 'uncertain' and time.monotonic() < until:
+            time.sleep(.03)
+        proc.kill(); proc.communicate(timeout=8)
+        self.assert_gone(child); self.wait_inactive(run)
+        state = oc.load_state(run)
+        self.assertEqual(state['stop_delivery']['status'], 'uncertain', output)
+        self.assertEqual(json.loads((run / 'stop.json').read_text())['execution'], state['execution'])
+        self.assertIn('steering_uncertain', (run / 'journal.jsonl').read_text())
+        self.assertTrue((run / 'CONTROL.md').read_text().startswith('STOP'))
 
 
 if __name__ == "__main__":

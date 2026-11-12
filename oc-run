@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import uuid
 
@@ -214,6 +215,51 @@ class NativeServer:
         raise ValueError("private OpenCode server did not start; inspect server log")
 
 
+def steer(server, run, state, text, delivery):
+    """Reconcile an uncertain admission before retrying the same native inbox ID."""
+    def record(status, error=None):
+        delivery.update(status=status)
+        journal(run, 'steering_' + status, message=delivery['id'], error=error)
+        save(run, state)
+
+    path = f"session/{state['session']}"
+    if delivery['status'] in ('confirmed', 'rejected'):
+        return
+    if delivery['status'] == 'uncertain':
+        try:
+            pending = server.request(path + '/inbox')['data']
+            if not isinstance(pending, list) or not all(isinstance(x, dict) for x in pending):
+                raise ValueError('invalid inbox response')
+            if any(x.get('id') == delivery['id'] for x in pending):
+                record('confirmed')
+                return
+            try:
+                message = server.request(path + '/message/' + delivery['id'])['data']
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    raise
+            else:
+                if not isinstance(message, dict) or message.get('id') != delivery['id']:
+                    raise ValueError('invalid message response')
+                record('confirmed')
+                return
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            record('uncertain', str(exc))
+            return  # No absence proof: keep CONTROL.md and do not duplicate a POST.
+    # Persist intent before sending. A runner crash cannot erase an unknown outcome.
+    record('uncertain')
+    try:
+        receipt = server.request(path + '/prompt', {"id": delivery['id'], "text": text,
+                                 "delivery": "steer", "resume": False})
+        if not isinstance(receipt, dict) or not isinstance(receipt.get('data'), dict) \
+                or receipt['data'].get('id') != delivery['id']:
+            raise ValueError('steering acknowledgement missing the requested ID')
+    except urllib.error.HTTPError as exc:
+        record('rejected' if exc.code in (400, 401, 403, 404, 409, 422) else 'uncertain', str(exc))
+    except (OSError, ValueError) as exc:
+        record('uncertain', str(exc))
+    else:
+        record('confirmed')
 
 
 def invoke(binary, prompt, run, name, session, on_tick, on_event=lambda _: None, server=None, leases=()):
@@ -438,8 +484,6 @@ def identity(pid):
 
 def control(run, command, force=False):
     state = load_state(run)
-    if not state:
-        raise ValueError("unknown run or legacy format; use handoff to inspect")
     running = active(run)
     status = state['status']
     if running and identity(state.get('pid', -1)) != state.get('identity'):
@@ -452,7 +496,7 @@ def control(run, command, force=False):
                    "execution": state.get('execution')}
         atomic_write(run / ('force.json' if force else 'stop.json'), json.dumps(request) + "\n")
         journal(run, 'stop_requested', **request)
-        status = 'stopping; delivery at next worker step boundary'
+        status = 'stopping'
         if force:
             pid = state.get('pid')
             if not pid or not state.get('identity') or identity(pid) != state['identity']:
@@ -465,7 +509,10 @@ def control(run, command, force=False):
                 os.kill(pid, signal.SIGKILL)  # pipe guardians clean only their own process groups
             status = 'force requested; in-flight actions uncertain'
     elif running and json.loads(read(run / 'stop.json') or '{}').get('execution') == state.get('execution'):
-        status = 'stopping; delivery at next worker step boundary'
+        status = 'stopping'
+    if status == 'stopping':
+        delivery = state.get('stop_delivery', {}).get('status', 'pending')
+        status += f'; steering {delivery} (confirmed means native acceptance, not worker completion)'
     print(f"oc-run: {status}\nRun: {run}\nSession: {state.get('session') or 'not recorded'}")
     return 0
 
@@ -529,12 +576,13 @@ def execute(args, binary, root, run=None, repo_lock=None):
     fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
     leases = (owner.fileno(), repo_lock) if repo_lock is not None else (owner.fileno(),)
     start, prior = time.monotonic(), state["elapsed"]
+    state.pop('stop_delivery', None)
     state.update(status="running", reason="", budget=prior + args.duration,
                  pid=os.getpid(), identity=identity(os.getpid()), push=args.push, execution=uuid.uuid4().hex)
     save(run, state)
     journal(run, 'running', execution=state['execution'], session=state['session'])
     print(f"oc-run: state {run}\noc-run: pid {os.getpid()} (status / stop --latest)", flush=True)
-    stopped, last_saved, notified = False, start, False
+    stopped, last_saved, next_delivery = False, start, start
     code, handlers, server = 1, {}, NativeServer()
     repeat, repeat_count, last_call, warned = None, 0, None, False
     control_prefix = 'msg_ocrun_' + hashlib.sha256(os.fsencode(run)).hexdigest()[:12] + '_'
@@ -544,20 +592,8 @@ def execute(args, binary, root, run=None, repo_lock=None):
             signal.signal(sig, signal.SIG_IGN)
         raise KeyboardInterrupt(signum)
 
-    def notify(text):
-        if not state['session'] or not hasattr(server, 'url'):
-            return False
-        try:
-            receipt = server.request(f"session/{state['session']}/prompt",
-                                     {"id": control_prefix + uuid.uuid4().hex, "text": text, "delivery": "steer", "resume": False})
-            journal(run, 'steering_admitted', receipt=receipt)
-        except (OSError, ValueError) as exc:
-            journal(run, 'steering_unconfirmed', error=str(exc))
-        return True  # no automatic duplicate POST after an unknown outcome
-
-
     def tick():
-        nonlocal stopped, last_saved, notified
+        nonlocal stopped, last_saved, next_delivery
         now = time.monotonic()
         state['elapsed'] = prior + now - start
         request = json.loads(read(run / 'stop.json') or '{}')
@@ -565,12 +601,14 @@ def execute(args, binary, root, run=None, repo_lock=None):
         if not stopped and (requested or now - start >= args.duration):
             stopped = True
             state.update(status='stopping', reason='user stop requested' if requested else 'budget ended')
+            state['stop_delivery'] = {'id': control_prefix + state['execution'], 'status': 'pending'}
             atomic_write(run / "CONTROL.md", STOP)
             journal(run, 'stopping', reason=state['reason'])
             save(run, state)
             print(f"oc-run: {state['reason']}; waiting for a safe handoff", flush=True)
-        if stopped and not notified:
-            notified = notify(STOP)
+        if stopped and state['session'] and hasattr(server, 'url') and now >= next_delivery:
+            next_delivery = now + 2
+            steer(server, run, state, STOP, state['stop_delivery'])
         if now - last_saved >= 30:
             save(run, state)
             last_saved = now
@@ -606,7 +644,7 @@ def execute(args, binary, root, run=None, repo_lock=None):
             incident(run, state, warning)
             atomic_write(run / 'CONTROL.md', STOP if stopped else warning + "\n")
             if not stopped:
-                notify(warning)
+                steer(server, run, state, warning, {'id': control_prefix + uuid.uuid4().hex, 'status': 'pending'})
 
     def call(phase, prompt):
         state['invocations'] += 1

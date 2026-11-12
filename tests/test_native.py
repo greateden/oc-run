@@ -26,11 +26,16 @@ class NativeTests(unittest.TestCase):
                                 'location': {'directory': str(project)}})['data']['id']
                             api.request(f'session/{session}/prompt', {'id': message,
                                 'text': 'STOP: final handoff only.', 'delivery': 'steer', 'resume': False})
+                            # Native admission is idempotent for a caller-supplied ID.
+                            api.request(f'session/{session}/prompt', {'id': message,
+                                'text': 'STOP: final handoff only.', 'delivery': 'steer', 'resume': False})
                             self.assertFalse(api.request(f'session/{session}/interrupt?resume=false', {})['interrupted'])
                         self.assertEqual(api.request(f'session/{session}')['data']['id'], session)
                         pending = api.request(f'session/{session}/inbox')['data']
                         self.assertTrue(any(x['id'] == message and x['delivery'] == 'steer' for x in pending))
+                        self.assertEqual(sum(x['id'] == message for x in pending), 1)
                         if attempt == 1:
                             api.request(f'session/{session}/inbox/{message}', method='DELETE')
                             pending = api.request(f'session/{session}/inbox')['data']
                             self.assertFalse(any(x['id'] == message for x in pending))
+                            api.request(f'session/{session}', method='DELETE')
