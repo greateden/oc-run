@@ -408,6 +408,7 @@ def handoff(run, state):
              "\n\nLast report:\n" + excerpt(report.get("summary", "No final model report recorded.")),
              "## Evidence cited by the model\n\n" +
              excerpt("\n".join("- " + x for x in report.get("evidence", [])) or "None recorded."),
+             f"Observed successful tools: {state.get('successful_tools', 0)}. Independent acceptance checks: not run.",
              "## Failed or interrupted operations\n\n" +
              excerpt("\n".join("- " + x for x in state.get("incidents", [])) or "None recorded."),
              "## File changes\n\nBefore:\n" + excerpt(state['git_before']['changes'], 1000) +
@@ -752,7 +753,6 @@ def main(argv=None):
             parser.add_argument("task", nargs="+", help="original task")
         parser.add_argument("--dry-run", action="store_true", help="show intent without running commands or writing state")
         parser.add_argument("--push", action="store_true", help="permit reviewed, ordinary Git pushes")
-        parser.add_argument("--stop-when-done", action="store_true", help="stop after required work is complete")
     if command in ('handoff', 'resume', 'status', 'stop'):
         group = parser.add_mutually_exclusive_group(required=command != "status")
         group.add_argument("--latest", action="store_true")

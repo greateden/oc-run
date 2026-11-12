@@ -616,6 +616,20 @@ class RunnerTests(unittest.TestCase):
                 self.assertTrue((self.project / 'action-finished').exists())
                 self.assertFalse((run / 'force.json').exists())
 
+    def test_completion_is_reported_not_independently_verified(self):
+        for scenario in ('incomplete', 'no_evidence'):
+            code, output, run, state = self.run_fake(scenario)
+            self.assertEqual(code, 3, output)
+            self.assertEqual(state['status'], 'incomplete')
+            self.assertGreater(state['successful_tools'], 0)
+        code, output, run, state = self.run_fake()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(state['status'], 'reported-complete')
+        self.assertIn('Independent acceptance checks: not run', (run / 'HANDOFF.md').read_text())
+        proc = self.launch('success', '5s', '--stop-when-done', 'unused')
+        output, _ = proc.communicate(timeout=2)
+        self.assertEqual(proc.returncode, 2, output)
+        self.assertIn('unrecognized arguments', output)
 
     def test_unknown_stop_survives_runner_crash(self):
         proc = self.launch('stop_offline', '1h', 'test')

@@ -122,4 +122,8 @@ if scenario == "malformed":
 report = {"decision": "STOP", "complete": True, "reason": "Required work checked",
           "summary": "Completed: read/write fixture. Failed: unavailable tool; later read succeeded. Unverified: none in fixture.",
           "evidence": ["read answer.txt: 12"], "next": "none"}
+if scenario == 'incomplete':
+    report['complete'] = False
+if scenario == 'no_evidence':
+    report['evidence'] = []
 emit("text", {"text": 'OC_RUN_RESULT ' + json.dumps(report)})
