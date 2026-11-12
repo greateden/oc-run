@@ -53,6 +53,12 @@ class RunnerTests(unittest.TestCase):
             time.sleep(.03)
         self.fail(f"fixture did not create {name}")
 
+    def wait_inactive(self, run):
+        until = time.monotonic() + 8
+        while oc.active(run) and time.monotonic() < until:
+            time.sleep(.03)
+        self.assertFalse(oc.active(run), 'guardian still holds run lease')
+
     def assert_gone(self, pid):
         until = time.monotonic() + 6
         while time.monotonic() < until:
@@ -62,11 +68,11 @@ class RunnerTests(unittest.TestCase):
             time.sleep(.05)
         self.fail(f"child {pid} survived cleanup")
 
-    def test_success_and_same_session_review(self):
+    def test_success_without_milestone_review(self):
         code, output, run, state = self.run_fake()
         self.assertEqual(code, 0, output)
-        self.assertEqual(state["status"], "reviewed-complete")
-        self.assertEqual(state["invocations"], 2)
+        self.assertEqual(state["status"], "reported-complete")
+        self.assertEqual(state["invocations"], 1)
         self.assertEqual(state["session"], "ses_fixture")
         self.assertEqual((self.project / "answer.txt").read_text(), "12\n")
         self.assertIn("not independent proof", (run / "HANDOFF.md").read_text())
@@ -76,7 +82,8 @@ class RunnerTests(unittest.TestCase):
 
     def test_long_work_survives_budget(self):
         code, output, run, state = self.run_fake("long", "0.2s", "long action")
-        self.assertEqual(code, 0, output)
+        self.assertEqual(code, 3, output)
+        self.assertEqual(state["status"], "stopped")
         self.assertGreater(state["elapsed"], .5)
         self.assertIn("STOP", (run / "CONTROL.md").read_text())
         self.assertIn("budget ended", output)
@@ -90,11 +97,12 @@ class RunnerTests(unittest.TestCase):
             ticks = []
             with mock.patch.object(oc.subprocess, "Popen", return_value=process), \
                     mock.patch.object(oc, "cleanup"), mock.patch.object(oc.time, "sleep"), \
-                    mock.patch.object(oc.time, "monotonic", side_effect=[0, 1501, 7200]):
+                    mock.patch.object(oc.time, "monotonic", side_effect=iter(range(0, 100000, 1501))):
                 code = oc.invoke("fixture", "prompt", run, "long", None,
                                  lambda: ticks.append(oc.time.monotonic()))
             self.assertEqual(code, 0)
-            self.assertEqual(ticks, [0, 1501, 7200])
+            self.assertEqual(len(ticks), 3)
+            self.assertGreater(ticks[-1], 7200)
 
     def test_tool_failure_keeps_success_and_disclosure(self):
         code, output, run, state = self.run_fake("tool_failure")
@@ -104,23 +112,33 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("Tool unavailable", text)
         self.assertIn("later read succeeded", text)
 
-    def test_final_review_can_use_prior_tool_evidence(self):
-        code, output, run, state = self.run_fake('prior_evidence')
+    def test_continuous_milestones_need_no_extra_inference(self):
+        code, output, run, state = self.run_fake('milestones')
         self.assertEqual(code, 0, output)
-        self.assertEqual(state['invocations'], 4)
-        self.assertEqual(state['successful_tools'], 1)
+        self.assertEqual(state['invocations'], 1)
+        self.assertEqual(state['successful_tools'], 4)
+        self.assertNotIn('REVIEW ONLY', (self.project / 'prompts.txt').read_text())
 
-    def test_repeated_unproductive_action_stops(self):
-        code, output, run, state = self.run_fake("repeat")
-        self.assertEqual(code, 3, output)
-        self.assertEqual(state["invocations"], 4)
-        self.assertIn("repeated", state["reason"])
-
-    def test_pivot_carries_different_action(self):
-        code, output, run, state = self.run_fake("pivot")
+    def test_repeated_failure_warns_without_killing_worker(self):
+        code, output, run, state = self.run_fake('repeat')
         self.assertEqual(code, 0, output)
-        self.assertIn("PIVOT", output)
-        self.assertEqual(state["invocations"], 4)
+        records = [json.loads(x) for x in (run / 'journal.jsonl').read_text().splitlines()]
+        self.assertEqual(sum(x['kind'] == 'warning' for x in records), 1)
+        self.assertIn('WARN', (self.project / 'notifications.jsonl').read_text())
+        self.assertEqual(state['invocations'], 1)
+
+    def test_changed_inputs_and_successful_progress_do_not_warn(self):
+        for scenario in ('changed', 'progress'):
+            with self.subTest(scenario=scenario):
+                code, output, run, state = self.run_fake(scenario)
+                self.assertEqual(code, 0, output)
+                self.assertNotIn('"kind": "warning"', (run / 'journal.jsonl').read_text())
+
+    def test_worker_survives_unavailable_native_inbox(self):
+        code, output, run, state = self.run_fake('supervisor_unavailable')
+        self.assertEqual(code, 0, output)
+        self.assertIn('steering_unconfirmed', (run / 'journal.jsonl').read_text())
+        self.assertTrue((self.project / 'answer.txt').exists())
 
     def test_premature_completion_is_unverified(self):
         code, output, run, state = self.run_fake("premature")
@@ -157,12 +175,13 @@ class RunnerTests(unittest.TestCase):
         proc.kill()
         proc.communicate(timeout=10)
         self.assert_gone(child)
+        self.wait_inactive(next(p for p in self.state.iterdir() if p.is_dir()))
         code, output, run, state = self.run_fake("success", "resume", "5s", "--latest")
         self.assertEqual(code, 0, output)
         self.assertEqual((self.project / "partial.txt").read_text(), "Useful output before runner crash\n")
         self.assertIn("Resumed", str(state["incidents"]))
-        self.assertEqual(state["invocations"], 3)
-        self.assertEqual(len(list(run.glob("*.jsonl"))), 3)
+        self.assertEqual(state["invocations"], 2)
+        self.assertEqual(len(list(run.glob("[0-9]*-*.jsonl"))), 2)
 
     def test_transport_error_is_not_success(self):
         code, output, run, state = self.run_fake("transport")
@@ -175,7 +194,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("Useful partial work", (run / "HANDOFF.md").read_text())
         self.assertIn("exit=7", str(state["incidents"]))
 
-    def test_bad_review_preserves_useful_work(self):
+    def test_bad_final_report_preserves_useful_work(self):
         code, output, run, state = self.run_fake("malformed")
         self.assertEqual(code, 1, output)
         self.assertTrue((self.project / "answer.txt").exists())
@@ -209,6 +228,119 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, output)
         self.assertIn("Original task", output)
         self.assertEqual(before, {p.name: p.read_bytes() for p in run.iterdir() if p.is_file()})
+
+    def test_cooperative_stop_returns_promptly_and_finishes_action(self):
+        proc = self.launch('soft_stop', '1h', 'finish fixture')
+        self.wait_file('action-started')
+        run = next(p for p in self.state.iterdir() if p.is_dir())
+        start = time.monotonic()
+        stop = self.launch('success', 'stop', '--latest')
+        output, _ = stop.communicate(timeout=2)
+        self.assertEqual(stop.returncode, 0, output)
+        self.assertLess(time.monotonic() - start, 1)
+        self.assertIn('stopping', output)
+        self.assertTrue((run / 'stop.json').exists())
+        output, _ = proc.communicate(timeout=6)
+        self.assertEqual(proc.returncode, 3, output)
+        self.assertTrue((self.project / 'action-finished').exists())
+        self.assertEqual(json.loads((run / 'run.json').read_text())['status'], 'stopped')
+        messages = (self.project / 'notifications.jsonl').read_text()
+        self.assertIn('steer', messages)
+        self.assertIn('STOP', messages)
+
+    def test_soft_stop_never_escalates_a_stalled_action(self):
+        proc = self.launch('stall', '1h', 'test')
+        child = int(self.wait_file('child.pid').read_text())
+        stop = self.launch('success', 'stop', '--latest')
+        output, _ = stop.communicate(timeout=2)
+        self.assertEqual(stop.returncode, 0, output)
+        time.sleep(.5)
+        self.assertIsNone(proc.poll())
+        proc.terminate(); proc.communicate(timeout=10)
+        self.assert_gone(child)
+
+    def test_force_stop_cleans_resistant_process_group(self):
+        proc = self.launch('stall', '1h', 'test')
+        child = int(self.wait_file('child.pid').read_text())
+        stop = self.launch('success', 'stop', '--latest', '--force')
+        output, _ = stop.communicate(timeout=10)
+        self.assertEqual(stop.returncode, 0, output)
+        proc.communicate(timeout=10)
+        self.assert_gone(child)
+        run = next(p for p in self.state.iterdir() if p.is_dir())
+        self.assertEqual(json.loads((run / 'run.json').read_text())['status'], 'forced')
+        self.assertIn('external side effects', (run / 'HANDOFF.md').read_text())
+
+    def test_status_and_stop_on_stopped_and_unknown_runs(self):
+        _, _, run, _ = self.run_fake()
+        for args in [('status',), ('stop', '--latest')]:
+            proc = self.launch('success', *args)
+            output, _ = proc.communicate(timeout=2)
+            self.assertEqual(proc.returncode, 0, output)
+            self.assertIn('reported-complete', output)
+        self.assertFalse((run / 'stop.json').exists())
+        proc = self.launch('success', 'stop', '--run', str(self.base / 'absent'))
+        output, _ = proc.communicate(timeout=2)
+        self.assertEqual(proc.returncode, 2, output)
+        self.assertIn('unknown run', output)
+
+    def test_active_session_is_recorded_before_invocation_ends(self):
+        proc = self.launch('stall', '1h', 'test')
+        child = int(self.wait_file('child.pid').read_text())
+        run = next(p for p in self.state.iterdir() if p.is_dir())
+        until = time.monotonic() + 2
+        while json.loads((run / 'run.json').read_text())['session'] is None and time.monotonic() < until:
+            time.sleep(.03)
+        self.assertEqual(json.loads((run / 'run.json').read_text())['session'], 'ses_fixture')
+        self.assertIn('"kind": "session"', (run / 'journal.jsonl').read_text())
+        proc.terminate(); proc.communicate(timeout=10); self.assert_gone(child)
+
+    def test_recovery_preserves_torn_log_and_non_idempotent_uncertainty(self):
+        proc = self.launch('crash', '1h', 'test')
+        child = int(self.wait_file('child.pid').read_text())
+        proc.kill(); proc.communicate(timeout=10); self.assert_gone(child)
+        run = next(p for p in self.state.iterdir() if p.is_dir())
+        self.wait_inactive(run)
+        raw = run / '0001-work.jsonl'
+        with raw.open('ab') as handle:
+            handle.write(b'{"type":"tool_use","part":')
+        old_bytes = raw.read_bytes()
+        status = self.launch('success', 'status')
+        output, _ = status.communicate(timeout=2)
+        self.assertIn('no live owner', output)
+        code, output, _, state = self.run_fake('success', 'resume', '5s', '--latest')
+        self.assertEqual(code, 0, output)
+        self.assertEqual(raw.read_bytes(), old_bytes)
+        self.assertIn('non-idempotent', str(state['incidents']))
+        self.assertIn('external non-idempotent action', str(state['incidents']))
+        self.assertIn('session_reconciled', (run / 'journal.jsonl').read_text())
+        self.assertIn('RECOVERY:', (self.project / 'prompts.txt').read_text())
+
+    def test_state_kept_outside_git_repository(self):
+        subprocess.run(['git', 'init', '-q'], cwd=self.project, check=True)
+        env = {**self.env, 'OC_RUN_STATE_DIR': str(self.project / 'state')}
+        proc = subprocess.run([sys.executable, str(ROOT / 'oc-run'), '5s', 'test'],
+                              cwd=self.project, env=env, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn('outside the project', proc.stderr)
+
+    def test_resume_cancels_only_its_own_stale_control_messages(self):
+        self.run_fake()
+        code, output, run, state = self.run_fake('stale_control', 'resume', '5s', '--latest')
+        self.assertEqual(code, 0, output)
+        cancelled = (self.project / 'cancelled.txt').read_text()
+        self.assertIn('msg_ocrun_', cancelled)
+        self.assertNotIn('msg_unrelated', cancelled)
+        self.assertIn('stale_control_cancelled', (run / 'journal.jsonl').read_text())
+
+    def test_append_after_torn_control_journal_preserves_later_record(self):
+        run = self.base / 'recording'; run.mkdir()
+        path = run / 'journal.jsonl'
+        path.write_bytes(b'{"kind":"partial')
+        oc.journal(run, 'resumed')
+        lines = path.read_bytes().splitlines()
+        self.assertEqual(lines[0], b'{"kind":"partial')
+        self.assertEqual(json.loads(lines[1])['kind'], 'resumed')
 
     def test_duration_validation(self):
         self.assertEqual(oc.duration("10h"), 36000)
