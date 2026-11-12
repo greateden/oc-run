@@ -38,15 +38,51 @@ def atomic_write(path, text):
             os.unlink(name)
 
 
-def read(path):
+def read(path, limit=1024 * 1024, required=False):
     """Never follow a state-file symlink or read a device."""
     try:
-        info = path.lstat()
-        if stat.S_ISREG(info.st_mode) and info.st_size <= 1024 * 1024:
-            return path.read_text(encoding="utf-8", errors="replace")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        if not required:
+            return ""
+        raise
     except OSError:
-        pass
-    return ""
+        if not required and path.is_symlink():
+            return ""
+        raise
+    with os.fdopen(fd, encoding="utf-8", errors="strict" if required else "replace", newline="") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError(f"not a regular file: {path}")
+        text = handle.read() if limit is None else handle.read(limit + 1)
+        if limit is not None and len(text) > limit:
+            raise ValueError(f"file exceeds read limit: {path}")
+        return text
+
+
+def load_state(run):
+    # Old snapshots can exceed 1 MiB. Read them explicitly, never as missing state.
+    try:
+        state = json.loads(read(run / 'run.json', limit=None, required=True))
+        if (not isinstance(state, dict) or not isinstance(state.get('cwd'), str)
+                or not isinstance(state.get('status'), str)
+                or not all(isinstance(state.get(k), (int, float)) for k in ('elapsed', 'budget', 'invocations'))
+                or not isinstance(state.get('incidents'), list)
+                or not all(isinstance(x, str) for x in state['incidents'])
+                or not isinstance(state.get('git_before'), dict)
+                or not isinstance(state['git_before'].get('changes'), str)
+                or not isinstance(state.get('last_work', ''), str)
+                or (state.get('review') is not None and final_report(json.dumps(state['review'])) is None)
+                or not isinstance(state.get('started', 0), (int, float))):
+            raise ValueError('invalid controller state fields')
+        if (state.get('session') is not None and not isinstance(state['session'], str)
+                or state.get('pid') is not None and (type(state['pid']) is not int or state['pid'] <= 0)
+                or not isinstance(state.get('stop_delivery', {}), dict)
+                or not isinstance(state.get('git_after', state['git_before']), dict)
+                or not isinstance(state.get('git_after', state['git_before']).get('changes'), str)):
+            raise ValueError('invalid session, process or control fields')
+        return state
+    except (ValueError, OSError) as exc:
+        raise ValueError(f"cannot read state {run / 'run.json'}: {exc}") from exc
 
 
 def duration(text):
@@ -178,6 +214,8 @@ class NativeServer:
         raise ValueError("private OpenCode server did not start; inspect server log")
 
 
+
+
 def invoke(binary, prompt, run, name, session, on_tick, on_event=lambda _: None, server=None, leases=()):
     command = [binary, "run", "--format", "json"]
     command += ["--server", server.url] if server else ["--standalone"]
@@ -224,9 +262,33 @@ def invoke(binary, prompt, run, name, session, on_tick, on_event=lambda _: None,
             os.fsync(log.fileno())
 
 
+def event_fields(event):
+    """Validate the small part of the native event shape we actually consume."""
+    if not isinstance(event, dict) or not isinstance(event.get('type'), str):
+        raise ValueError('event/type must be an object/string')
+    if event.get('sessionID') is not None and (not isinstance(event['sessionID'], str)
+                                             or len(event['sessionID']) > 200):
+        raise ValueError('invalid session ID')
+    values = []
+    parent = event
+    for key in ('part', 'state', 'metadata', 'metadata'):
+        value = parent.get(key)
+        if value is None:
+            value = {}
+        if not isinstance(value, dict):
+            raise ValueError(f'{key} must be an object or null')
+        values.append(value)
+        parent = value
+    part = values[0]
+    for key in ('id', 'callID', 'tool', 'text'):
+        if key in part and not isinstance(part[key], str):
+            raise ValueError(f'part.{key} must be a string')
+    return values
+
+
 def events(path):
     """Keep all raw output; extract facts without treating every tool error as fatal."""
-    result = {"session": None, "text": [], "failures": [], "successes": [], "errors": []}
+    result = {"session": None, "text": [], "failures": [], "successes": [], "errors": [], "diagnostics": []}
     calls = {}
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -234,18 +296,17 @@ def events(path):
                 event = json.loads(line)
             except ValueError:
                 continue  # CLI diagnostics remain in the raw log
-            if not isinstance(event, dict):
+            if isinstance(event, dict) and event.get('type') == 'error':
+                result["errors"].append(str(event.get("error", event))[:1000])
+            try:
+                part, state, meta, detail = event_fields(event)
+            except ValueError as exc:
+                result['diagnostics'].append(f'malformed event: {exc}; see {path.name}')
                 continue
             result["session"] = event.get("sessionID") or result["session"]
-            part = event.get("part") or {}
             if event.get("type") == "text":
                 result["text"].append(part.get("text", ""))
-            if event.get("type") == "error":
-                result["errors"].append(str(event.get("error", event))[:1000])
             if event.get("type") == "tool_use":
-                state = part.get("state") or {}
-                meta = state.get("metadata") or {}
-                detail = meta.get("metadata") or {}
                 code = meta.get("exit", detail.get("exit"))
                 bad = (state.get("status") == "error" or code not in (None, 0)
                        or meta.get("error") is True or detail.get("error") is True)
@@ -278,7 +339,7 @@ def final_report(text):
             or not isinstance(report.get("evidence"), list)
             or not all(isinstance(x, str) for x in report["evidence"])):
         return None
-    return report
+    return {k: report[k] for k in ('decision', 'complete', 'reason', 'summary', 'next', 'evidence')}
 
 
 def excerpt(text, limit=2000):
@@ -309,8 +370,30 @@ def handoff(run, state):
 
 
 def save(run, state):
-    atomic_write(run / "run.json", json.dumps(state, indent=2) + "\n")
+    if not state.get('compact_state') and (run / 'run.json').exists():
+        # Preserve pre-upgrade evidence once, before replacing an old snapshot.
+        if not (run / 'legacy-state.json').exists():
+            atomic_write(run / 'legacy-state.json', read(run / 'run.json', limit=None, required=True))
+    state['compact_state'] = True
+    preview = {k: state[k] for k in ('cwd', 'session', 'elapsed', 'budget', 'invocations', 'started',
+               'successful_tools', 'status', 'pid', 'identity', 'push', 'execution', 'compact_state',
+               'stop_delivery') if k in state}
+    preview['last_work'] = excerpt(state.get('last_work', ''))
+    preview['incidents'] = [excerpt(x, 1000) for x in state['incidents'][-12:]]
+    preview['reason'] = excerpt(state.get('reason', ''), 1000)
+    for key in ('git_before', 'git_after'):
+        if key in state:
+            preview[key] = {k: excerpt(v, 1000) if isinstance(v, str) else v for k, v in state[key].items()}
+    if state.get('review'):
+        preview['review'] = {k: excerpt(v) if isinstance(v, str) else v for k, v in state['review'].items()}
+        preview['review']['evidence'] = [excerpt(x, 1000) for x in state['review']['evidence'][:12]]
+    atomic_write(run / "run.json", json.dumps(preview, indent=2) + "\n")
     atomic_write(run / "HANDOFF.md", handoff(run, state))
+
+
+def incident(run, state, text):
+    journal(run, 'incident', detail=text)
+    state['incidents'] = (state['incidents'] + [text])[-12:]
 
 
 def active(run):
@@ -327,16 +410,24 @@ def active(run):
         os.close(fd)
 
 
-def latest(root):
+def latest(root, historical=False):
     if not root.exists():
         raise ValueError('no recorded run')
     choices = [p for p in root.iterdir() if p.is_dir() and not p.is_symlink()
                and ((p / "run.json").is_file() or (p / "STATE.md").is_file())]
-    local = [p for p in choices if json.loads(read(p / 'run.json') or '{}').get('cwd') == str(Path.cwd())]
-    choices = local or choices
+    states = {}
+    for path in choices:
+        if (path / 'run.json').exists() or (path / 'run.json').is_symlink():
+            try:
+                states[path] = load_state(path)
+            except ValueError as exc:
+                print(f'oc-run: {exc}; use --run PATH to inspect explicitly', file=sys.stderr)
+    local = [p for p, state in states.items() if Path(state['cwd']).resolve() == Path.cwd()]
+    choices = [p for p in choices if p in states or not (p / 'run.json').exists()]
+    choices = local or (choices if historical else [])
     if not choices:
-        raise ValueError("no recorded run")
-    return max(choices, key=lambda p: (active(p), json.loads(read(p / 'run.json') or '{}').get('started', 0), p.name))
+        raise ValueError("no recorded run for the current project; use --run PATH for explicit selection")
+    return max(choices, key=lambda p: (active(p), states.get(p, {}).get('started', 0), p.name))
 
 
 def identity(pid):
@@ -346,7 +437,7 @@ def identity(pid):
 
 
 def control(run, command, force=False):
-    state = json.loads(read(run / 'run.json') or '{}')
+    state = load_state(run)
     if not state:
         raise ValueError("unknown run or legacy format; use handoff to inspect")
     running = active(run)
@@ -407,26 +498,26 @@ def recover(run, state):
         state['session'] = facts['session'] or state.get('session')
         if facts['text'] and '-work' in path.name:
             state['last_work'] = facts['text']
-        for item in facts['failures'] + facts['errors']:
-            incident = f"{path.name}: {json.dumps(item, ensure_ascii=False)}"
-            if incident not in state['incidents']:
-                state['incidents'].append(incident)
+        for item in facts['failures'] + facts['errors'] + facts['diagnostics']:
+            text = f"{path.name}: {json.dumps(item, ensure_ascii=False)}"
+            if text not in state['incidents']:
+                incident(run, state, text)
     if state['status'] in ('running', 'stopping', 'interrupted', 'forced'):
-        state['incidents'].append("Prior invocation was in-flight: external side effects may have occurred "
-                                 "without a recorded result. Do not automatically repeat non-idempotent actions.")
+        incident(run, state, "Prior invocation was in-flight: external side effects may have occurred "
+                            "without a recorded result. Do not automatically repeat non-idempotent actions.")
     state['review'] = None
 
 
 def execute(args, binary, root, run=None, repo_lock=None):
     before = snapshot()
     if run:
-        state = json.loads(read(run / "run.json"))
+        state = load_state(run)
         if Path(state["cwd"]).resolve() != Path.cwd():
             raise ValueError("resume from the recorded project directory")
         if active(run):
             raise ValueError("run still has a live owner")
         recover(run, state)
-        state["incidents"].append("Resumed: inspect prior in-flight actions before repeating them.")
+        incident(run, state, "Resumed: inspect prior in-flight actions before repeating them.")
     else:
         run = Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%dT%H%M%S-"), dir=root))
         sync_directory(root)
@@ -464,6 +555,7 @@ def execute(args, binary, root, run=None, repo_lock=None):
             journal(run, 'steering_unconfirmed', error=str(exc))
         return True  # no automatic duplicate POST after an unknown outcome
 
+
     def tick():
         nonlocal stopped, last_saved, notified
         now = time.monotonic()
@@ -485,6 +577,11 @@ def execute(args, binary, root, run=None, repo_lock=None):
 
     def observe(event):
         nonlocal repeat, repeat_count, last_call, warned
+        try:
+            part, item, meta, nested = event_fields(event)
+        except ValueError as exc:
+            journal(run, 'malformed_event', error=str(exc))
+            return
         session = event.get('sessionID')
         if session and session != state['session']:
             state['session'] = session
@@ -492,10 +589,6 @@ def execute(args, binary, root, run=None, repo_lock=None):
             save(run, state)
         if event.get('type') != 'tool_use':
             return
-        part = event.get('part') or {}
-        item = part.get('state') or {}
-        meta = item.get('metadata') or {}
-        nested = meta.get('metadata') or {}
         bad = (item.get('status') == 'error' or meta.get('exit', nested.get('exit')) not in (None, 0)
                or meta.get('error') is True or nested.get('error') is True)
         call = part.get('callID') or part.get('id')
@@ -510,7 +603,7 @@ def execute(args, binary, root, run=None, repo_lock=None):
             warning = "WARN: four consecutive identical unsuccessful actions with unchanged recorded inputs/results. " + \
                       "Inspect what changed before retrying; choose a smaller different approach if no new evidence."
             journal(run, 'warning', reason=warning, call=call)
-            state['incidents'].append(warning)
+            incident(run, state, warning)
             atomic_write(run / 'CONTROL.md', STOP if stopped else warning + "\n")
             if not stopped:
                 notify(warning)
@@ -528,11 +621,11 @@ def execute(args, binary, root, run=None, repo_lock=None):
             state['session'] = facts['session'] or state['session']
             state['last_work'] = facts['text'] or state.get('last_work', '')
             atomic_write(run / (name + '.md'), facts['text'])
-            state['incidents'].extend(f"{name}.jsonl: {json.dumps(x, ensure_ascii=False)}"
-                                      for x in facts['failures'] + facts['errors'])
+            for item in facts['failures'] + facts['errors'] + facts['diagnostics']:
+                incident(run, state, f"{name}.jsonl: {json.dumps(item, ensure_ascii=False)}")
         journal(run, 'invocation_ended', name=name, exit=rc)
         if rc != 0 or facts['errors']:
-            state['incidents'].append(f"{name}: process exit={rc}; work may still be useful.")
+            incident(run, state, f"{name}: process exit={rc}; work may still be useful.")
             raise ValueError("OpenCode invocation failed; inspect logs before resuming")
         if not state['session']:
             raise ValueError("OpenCode emitted no session ID; inspect the raw log")
@@ -581,7 +674,7 @@ def execute(args, binary, root, run=None, repo_lock=None):
         code = 128 + (exc.args[0] if exc.args else signal.SIGINT)
         state.update(status='forced' if json.loads(read(run / 'force.json') or '{}').get('execution') == state['execution'] else 'interrupted',
                      reason="Stopped by signal; in-flight results and external side effects are unverified.")
-        state['incidents'].append(state['reason'])
+        incident(run, state, state['reason'])
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         state.update(status="failed", reason=str(exc))
     finally:
@@ -630,7 +723,7 @@ def main(argv=None):
         print(f"Project: {Path.cwd()}\nBudget: {args.duration:.1f}s; no invocation timeout.\n"
               f"Push permitted: {args.push}. No commands executed or state created.")
         return 0
-    run = (args.run.expanduser().absolute() if args.run else latest(root)) if command != 'run' else None
+    run = (args.run.expanduser().absolute() if args.run else latest(root, historical=command == 'handoff')) if command != 'run' else None
     if run and (run.is_symlink() or not run.is_dir()):
         raise ValueError('unknown run or symlink run directory')
     if run:
@@ -640,9 +733,8 @@ def main(argv=None):
     if command in ('status', 'stop'):
         return control(run, command, getattr(args, 'force', False))
     if command == 'handoff':
-        state = read(run / 'run.json')
-        if state:
-            data = json.loads(state)
+        if (run / 'run.json').exists() or (run / 'run.json').is_symlink():
+            data = load_state(run)
             print(handoff(run, data))
             if data['status'] == 'running':
                 print("No final record: this run may be active or crashed. Inspect processes before resuming.")

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -394,16 +395,151 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('UNVERIFIED final candidate', output)
         self.assertEqual(before, {p.name: p.read_bytes() for p in run.iterdir()})
 
-    def test_long_handoff_excerpts_keep_full_state(self):
+    def test_long_handoff_excerpts_keep_full_evidence(self):
         _, _, run, state = self.run_fake()
         long = 'x' * 30000
         oc.atomic_write(run / 'task.txt', long)
         state.update(last_work=long, incidents=[long])
         state['review'].update(summary=long, next=long, evidence=[long])
+        oc.incident(run, state, long)
+        oc.atomic_write(run / '0001-work.md', long)
         oc.save(run, state)
         self.assertLess(len((run / 'HANDOFF.md').read_text()), 16000)
         self.assertEqual((run / 'task.txt').read_text(), long)
-        self.assertEqual(json.loads((run / 'run.json').read_text())['incidents'], [long])
+        self.assertLess((run / 'run.json').stat().st_size, 16000)
+        self.assertIn(long, (run / 'journal.jsonl').read_text())
+        self.assertEqual((run / '0001-work.md').read_text(), long)
+
+    def test_oversized_state_remains_stoppable_and_recoverable(self):
+        proc = self.launch('crash', '1h', 'test')
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        child = int(self.wait_file('child.pid').read_text())
+        run = next(p for p in self.state.iterdir() if p.is_dir())
+        until = time.monotonic() + 2
+        while oc.load_state(run)['session'] is None and time.monotonic() < until:
+            time.sleep(.03)
+        state = oc.load_state(run)
+        state.pop('compact_state', None)  # simulate a pre-upgrade snapshot
+        state['last_work'] = 'retained old output ' * 70000
+        old = json.dumps(state)
+        oc.atomic_write(run / 'run.json', old)
+        self.assertGreater((run / 'run.json').stat().st_size, 1024 * 1024)
+        for args in [('status',), ('stop', '--latest')]:
+            command = self.launch('success', *args)
+            output, _ = command.communicate(timeout=2)
+            self.assertEqual(command.returncode, 0, output)
+        proc.kill(); proc.communicate(timeout=10)
+        self.assert_gone(child); self.wait_inactive(run)
+        # The runner may already have compacted at the stop boundary.
+        if not (run / 'legacy-state.json').exists():
+            oc.atomic_write(run / 'run.json', old)
+        code, output, _, state = self.run_fake('success', 'resume', '5s', '--latest')
+        self.assertEqual(code, 0, output)
+        self.assertEqual((run / 'legacy-state.json').read_text(), old)
+        self.assertLess((run / 'run.json').stat().st_size, 64000)
+
+    def test_growing_overnight_journal_keeps_control_state_small(self):
+        _, _, run, state = self.run_fake()
+        for i in range(1200):
+            oc.incident(run, state, str(i) + ': ' + 'x' * 1200)
+            if i % 100 == 0:
+                oc.save(run, state)
+                self.assertLess((run / 'run.json').stat().st_size, 64000)
+        oc.save(run, state)
+        self.assertGreater((run / 'journal.jsonl').stat().st_size, 1024 * 1024)
+        self.assertEqual(len(state['incidents']), 12)
+        self.assertEqual(oc.load_state(run)['session'], 'ses_fixture')
+        self.assertEqual(len([x for x in (run / 'journal.jsonl').read_text().splitlines()
+                              if json.loads(x)['kind'] == 'incident']), 1200)
+        # A growing journal must not affect the control command's read path.
+        live = self.launch('stall', '1h', 'overnight fixture')
+        child = int(self.wait_file('child.pid').read_text())
+        live_run = next(p for p in self.state.iterdir() if p.is_dir() and p != run)
+        with (live_run / 'journal.jsonl').open('ab') as handle:
+            handle.write((run / 'journal.jsonl').read_bytes())
+        stop = self.launch('success', 'stop', '--latest')
+        output, _ = stop.communicate(timeout=2)
+        self.assertEqual(stop.returncode, 0, output)
+        self.assertTrue((live_run / 'stop.json').exists())
+        live.terminate(); live.communicate(timeout=10); self.assert_gone(child)
+
+    def test_corrupt_or_symlink_state_has_clear_error(self):
+        run = self.base / 'bad'; run.mkdir()
+        for text in ('{bad', 'null', '[]', '{}'):
+            (run / 'run.json').write_text(text)
+            with self.assertRaisesRegex(ValueError, 'cannot read state'):
+                oc.load_state(run)
+        (run / 'run.json').unlink()
+        (run / 'run.json').symlink_to(self.base / 'target')
+        with self.assertRaisesRegex(ValueError, 'cannot read state'):
+            oc.load_state(run)
+
+    def test_malformed_nested_events_do_not_hide_later_valid_events(self):
+        bad = [{'type': 'tool_use', 'part': value} for value in ([], 'oops', 42)]
+        for keys in [('state',), ('state', 'metadata'), ('state', 'metadata', 'metadata')]:
+            for value in ([], 'oops', 42, True):
+                event = {'type': 'tool_use', 'part': {}}
+                parent = event['part']
+                for key in keys[:-1]:
+                    parent[key] = {}; parent = parent[key]
+                parent[keys[-1]] = value
+                bad.append(event)
+        bad += [{'type': 'text', 'part': {'text': None}}, {'type': 'tool_use', 'part': {'id': []}}]
+        valid = [{'type': 'step_start', 'part': None}, {'type': 'tool_use'},
+                 {'type': 'tool_use', 'part': {'id': 'ok', 'tool': 'read', 'state': {
+                     'status': 'completed', 'metadata': None, 'output': 'useful'}}},
+                 {'type': 'text', 'part': {'text': 'after malformed'}}]
+        path = self.base / 'events.jsonl'
+        raw = ''.join(json.dumps(x) + '\n' for x in bad + valid)
+        path.write_text(raw)
+        facts = oc.events(path)
+        self.assertEqual(len(facts['diagnostics']), len(bad))
+        self.assertEqual(len(facts['successes']), 1)
+        self.assertEqual(facts['text'], 'after malformed')
+        self.assertEqual(path.read_text(), raw)
+        code, output, run, state = self.run_fake('bad_events')
+        self.assertEqual(code, 0, output)
+        self.assertEqual(state['successful_tools'], 1)
+        self.assertIn('malformed_event', (run / 'journal.jsonl').read_text())
+        code, output, _, state = self.run_fake('bad_event_then_error')
+        self.assertEqual(code, 1, output)
+        self.assertEqual(state['status'], 'failed')
+        self.assertIn('real fatal error', str(state['incidents']))
+
+    def test_latest_control_does_not_cross_projects(self):
+        proc = self.launch('stall', '1h', 'first project')
+        child = int(self.wait_file('child.pid').read_text())
+        first = next(p for p in self.state.iterdir() if p.is_dir())
+        other = self.base / 'other'; other.mkdir()
+        for args in [('status',), ('stop', '--latest'), ('resume', '1s', '--latest')]:
+            result = subprocess.run([sys.executable, str(ROOT / 'oc-run'), *args], cwd=other,
+                                    env=self.env, capture_output=True, text=True, timeout=2)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn('current project', result.stderr)
+        self.assertFalse((first / 'stop.json').exists())
+        second = subprocess.Popen([sys.executable, str(ROOT / 'oc-run'), '1h', 'second'], cwd=other,
+                    env={**self.env, 'FAKE_SCENARIO': 'stall'}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        until = time.monotonic() + 4
+        while not (other / 'child.pid').exists() and time.monotonic() < until:
+            time.sleep(.03)
+        other_child = int((other / 'child.pid').read_text())
+        stop = self.launch('success', 'stop', '--latest')
+        output, _ = stop.communicate(timeout=2)
+        self.assertEqual(stop.returncode, 0, output)
+        self.assertTrue((first / 'stop.json').exists())
+        second_run = next(p for p in self.state.iterdir() if p.is_dir() and p != first)
+        self.assertFalse((second_run / 'stop.json').exists())
+        explicit = subprocess.run([sys.executable, str(ROOT / 'oc-run'), 'status', '--run', str(first)],
+                                  cwd=other, env=self.env, capture_output=True, text=True, timeout=2)
+        self.assertEqual(explicit.returncode, 0, explicit.stdout + explicit.stderr)
+        for process in (proc, second):
+            process.terminate(); process.communicate(timeout=10)
+        self.assert_gone(child); self.assert_gone(other_child)
+
+
+
+
+
 
 
 if __name__ == "__main__":

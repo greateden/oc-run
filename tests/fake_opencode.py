@@ -62,6 +62,13 @@ def tool(name, inputs, output, bad=False):
 
 
 emit("step_start")
+if scenario == 'bad_events':
+    emit('tool_use', {'state': {'metadata': 'unexpected'}})
+    emit('tool_use', {'state': ['unexpected']})
+    emit('text', {'text': None})
+if scenario == 'bad_event_then_error':
+    emit('error', ['unexpected part'], error={'message': 'real fatal error'})
+    sys.exit(0)
 if scenario in ("stall", "crash"):
     emit('tool_use', {'id': 'call_external', 'tool': 'shell', 'state': {
         'status': 'running', 'input': {'command': 'external non-idempotent action'}}})
