@@ -27,6 +27,7 @@ class RunnerTests(unittest.TestCase):
         self.base = Path(self.tmp.name)
         self.project = self.base / "project"
         self.project.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=self.project, check=True)
         self.state = self.base / "state"
         self.fake = self.base / "opencode"
         self.fake.write_text((ROOT / "tests/fake_opencode.py").read_text())
@@ -511,6 +512,7 @@ class RunnerTests(unittest.TestCase):
         child = int(self.wait_file('child.pid').read_text())
         first = next(p for p in self.state.iterdir() if p.is_dir())
         other = self.base / 'other'; other.mkdir()
+        subprocess.run(['git', 'init', '-q'], cwd=other, check=True)
         for args in [('status',), ('stop', '--latest'), ('resume', '1s', '--latest')]:
             result = subprocess.run([sys.executable, str(ROOT / 'oc-run'), *args], cwd=other,
                                     env=self.env, capture_output=True, text=True, timeout=2)

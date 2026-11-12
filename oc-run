@@ -2,6 +2,7 @@
 """A small, cooperative OpenCode controller. Python standard library, POSIX only."""
 import argparse
 import base64
+from collections import deque
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -23,6 +24,10 @@ import urllib.request
 import uuid
 
 CLEANUP_SECONDS = 3
+MAX_EVENT_BYTES = 1024 * 1024
+SUMMARY_ITEMS = 32
+RECENT_CALLS = 256
+TEXT_LIMIT = 64 * 1024
 
 
 def atomic_write(path, text):
@@ -209,15 +214,24 @@ class NativeServer:
 
     def connect(self, log, proc, tick):
         until = time.monotonic() + 20
-        while proc.poll() is None and time.monotonic() < until:
-            text = read(log)
-            url = re.search(r"server listening on (http://127\.0\.0\.1:\d+)", text)
-            password = re.search(r"server password (\S+)", text)
-            if url and password:
-                self.url, self.password = url[1], password[1]
-                return
-            tick()
-            time.sleep(.1)
+        fd = os.open(log, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise ValueError(f'not a regular file: {log}')
+            reader = RecordReader(handle)
+            url = password = None
+            while proc.poll() is None and time.monotonic() < until:
+                for line in reader.records():
+                    if line is None:
+                        continue
+                    text = line.decode('utf-8', errors='replace')
+                    url = re.search(r"server listening on (http://127\.0\.0\.1:\d+)", text) or url
+                    password = re.search(r"server password (\S+)", text) or password
+                    if url and password:
+                        self.url, self.password = url[1], password[1]
+                        return
+                tick()
+                time.sleep(.1)
         raise ValueError("private OpenCode server did not start; inspect server log")
 
 
@@ -268,7 +282,38 @@ def steer(server, run, state, text, delivery):
         record('confirmed')
 
 
-def invoke(binary, prompt, run, name, session, on_tick, on_event=lambda _: None, server=None, leases=()):
+class RecordReader:
+    """Read complete bounded records, including across temporary tail EOFs."""
+    def __init__(self, handle):
+        self.handle = handle
+        self.pending = bytearray()
+        self.oversized = False
+
+    def records(self):
+        while chunk := self.handle.readline(64 * 1024):
+            if not self.oversized:
+                self.pending.extend(chunk)
+                if len(self.pending) > MAX_EVENT_BYTES:
+                    self.pending.clear()
+                    self.oversized = True
+            if chunk.endswith(b'\n'):
+                line = None if self.oversized else bytes(self.pending)
+                self.pending.clear()
+                self.oversized = False
+                yield line
+
+    def events(self):
+        for line in self.records():
+            if line is None:
+                yield None  # Diagnose skipped oversized records; raw evidence stays on disk.
+                continue
+            try:
+                yield json.loads(line)
+            except (ValueError, RecursionError):
+                continue  # CLI diagnostics and malformed JSON stay in the raw log.
+
+
+def invoke(binary, prompt, run, name, session, on_tick, on_event=lambda _: None, server=None, leases=(), summary=None):
     command = [binary, "run", "--format", "json"]
     command += ["--server", server.url] if server else ["--standalone"]
     if session:
@@ -281,20 +326,14 @@ def invoke(binary, prompt, run, name, session, on_tick, on_event=lambda _: None,
     with path.open("xb", buffering=0) as log, path.open("rb") as tail, tempfile.TemporaryFile() as message:
         message.write(prompt.encode())
         message.seek(0)
-        pending, last_sync = b"", time.monotonic()
+        reader, last_sync = RecordReader(tail), time.monotonic()
 
         def drain():
-            nonlocal pending, last_sync
-            pending += tail.read()
-            while b"\n" in pending:
-                line, pending = pending.split(b"\n", 1)
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(event, dict):
-                    continue
-                if event.get('type') in ('step_start', 'tool_use', 'text', 'error', 'step_finish'):
+            nonlocal last_sync
+            for event in reader.events():
+                if summary is not None:
+                    summary.consume(event)
+                if isinstance(event, dict) and event.get('type') in ('step_start', 'tool_use', 'text', 'error', 'step_finish'):
                     os.fsync(log.fileno())
                     on_event(event)
             if time.monotonic() - last_sync >= 1:
@@ -338,42 +377,74 @@ def event_fields(event):
     return values
 
 
-def events(path):
-    """Keep all raw output; extract facts without treating every tool error as fatal."""
-    result = {"session": None, "text": [], "failures": [], "successes": [], "errors": [], "diagnostics": []}
-    calls = {}
-    with path.open(encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue  # CLI diagnostics remain in the raw log
-            if isinstance(event, dict) and event.get('type') == 'error':
-                result["errors"].append(str(event.get("error", event))[:1000])
-            try:
-                part, state, meta, detail = event_fields(event)
-            except ValueError as exc:
-                result['diagnostics'].append(f'malformed event: {exc}; see {path.name}')
-                continue
-            result["session"] = event.get("sessionID") or result["session"]
-            if event.get("type") == "text":
-                result["text"].append(part.get("text", ""))
-            if event.get("type") == "tool_use":
-                code = meta.get("exit", detail.get("exit"))
-                bad = (state.get("status") == "error" or code not in (None, 0)
-                       or meta.get("error") is True or detail.get("error") is True)
-                record = {"id": part.get("callID") or part.get("id"), "tool": part.get("tool"),
-                          "input": state.get("input"), "status": state.get("status"),
-                          "detail": str(state.get("error") or state.get("output", ""))[:1000]}
-                # The latest event for a call wins (pending -> completed, for example).
-                calls[record["id"] or len(calls)] = (record, bad)
-    for record, bad in calls.values():
-        if bad or record["status"] not in ("completed",):
-            result["failures"].append(record)
+class EventSummary:
+    """Recent facts only; complete output remains in the raw invocation log."""
+    def __init__(self):
+        self.result = {"session": None, "text": "", "successful_tools": 0}
+        self.result.update({key: deque(maxlen=SUMMARY_ITEMS)
+                            for key in ('failures', 'successes', 'errors', 'diagnostics')})
+        self.calls = {}
+        self.limited = False
+
+    def settle(self, record, bad):
+        if bad or record['status'] != 'completed':
+            self.result['failures'].append(record)
         else:
-            result["successes"].append(record)
-    result["text"] = "\n".join(result["text"])
-    return result
+            self.result['successful_tools'] += 1
+            self.result['successes'].append(record)
+
+    def consume(self, event):
+        result = self.result
+        if event is None:
+            result['diagnostics'].append('oversized event skipped; inspect raw log')
+            return
+        if isinstance(event, dict) and event.get('type') == 'error':
+            result['errors'].append(str(event.get('error', event))[:1000])
+        try:
+            part, state, meta, detail = event_fields(event)
+        except ValueError as exc:
+            result['diagnostics'].append(f'malformed event: {exc}; inspect raw log')
+            return
+        result['session'] = event.get('sessionID') or result['session']
+        if event.get('type') == 'text':
+            text = result['text'] + ('\n' if result['text'] else '') + part.get('text', '')
+            self.limited |= len(text) > TEXT_LIMIT
+            result['text'] = text[-TEXT_LIMIT:]
+        if event.get('type') == 'tool_use':
+            code = meta.get('exit', detail.get('exit'))
+            bad = (state.get('status') == 'error' or code not in (None, 0)
+                   or meta.get('error') is True or detail.get('error') is True)
+            call_id = part.get('callID') or part.get('id')
+            record = {'id': excerpt(call_id, 200) if call_id else None,
+                      'tool': excerpt(part.get('tool', ''), 200),
+                      'input': excerpt(json.dumps(state.get('input')), 1000),
+                      'status': str(state.get('status'))[:100],
+                      'detail': str(state.get('error') or state.get('output', ''))[:1000]}
+            # Latest update wins within a bounded recent-call window.
+            key = hashlib.sha256(call_id.encode()).digest() if call_id else object()
+            self.calls.pop(key, None)
+            self.calls[key] = (record, bad)
+            if len(self.calls) > RECENT_CALLS:
+                self.settle(*self.calls.pop(next(iter(self.calls))))
+                self.limited = True
+
+    def finish(self):
+        for record, bad in self.calls.values():
+            self.settle(record, bad)
+        self.calls.clear()
+        if self.limited or any(len(self.result[k]) == SUMMARY_ITEMS
+                               for k in ('failures', 'successes', 'errors', 'diagnostics')):
+            self.result['diagnostics'].append('summary limited; inspect complete raw log')
+        return {key: list(value) if isinstance(value, deque) else value
+                for key, value in self.result.items()}
+
+
+def events(path):
+    summary = EventSummary()
+    with path.open('rb') as handle:
+        for event in RecordReader(handle).events():
+            summary.consume(event)
+    return summary.finish()
 
 
 def final_report(text):
@@ -545,10 +616,10 @@ STOP = "STOP: finish the active action safely, preserve results and give the fin
 def recover(run, state):
     """Rebuild from complete raw records; a torn final line stays in its original log."""
     state['successful_tools'] = 0
-    for path in sorted(run.glob('[0-9]*-*.jsonl')):
+    for path in sorted(run.glob('[0-9]*-*.jsonl'), key=lambda p: int(p.name.split('-')[0])):
         state['invocations'] = max(state['invocations'], int(path.name.split('-')[0]))
         facts = events(path)
-        state['successful_tools'] += len(facts['successes'])
+        state['successful_tools'] += facts['successful_tools']
         state['session'] = facts['session'] or state.get('session')
         if facts['text'] and '-work' in path.name:
             state['last_work'] = facts['text']
@@ -658,11 +729,12 @@ def execute(args, binary, root, run=None, repo_lock=None):
         name = f"{state['invocations']:04d}-{phase}"
         journal(run, 'invocation_started', name=name, session=state['session'])
         save(run, state)
+        summary = EventSummary()
         try:
-            rc = invoke(binary, prompt, run, name, state['session'], tick, observe, server, leases)
+            rc = invoke(binary, prompt, run, name, state['session'], tick, observe, server, leases, summary)
         finally:
-            facts = events(run / (name + '.jsonl'))
-            state['successful_tools'] += len(facts['successes'])
+            facts = summary.finish()
+            state['successful_tools'] += facts['successful_tools']
             state['session'] = facts['session'] or state['session']
             state['last_work'] = facts['text'] or state.get('last_work', '')
             atomic_write(run / (name + '.md'), facts['text'])
@@ -752,6 +824,7 @@ def main(argv=None):
         if command == 'run':
             parser.add_argument("task", nargs="+", help="original task")
         parser.add_argument("--dry-run", action="store_true", help="show intent without running commands or writing state")
+        parser.add_argument("--project-root", type=Path, help="required workspace root outside Git repositories")
         parser.add_argument("--push", action="store_true", help="permit reviewed, ordinary Git pushes")
     if command in ('handoff', 'resume', 'status', 'stop'):
         group = parser.add_mutually_exclusive_group(required=command != "status")
@@ -796,14 +869,23 @@ def main(argv=None):
     binary = os.environ.get('OC_RUN_BIN') or shutil.which('opencode')
     if not binary:
         raise ValueError("opencode not found on PATH")
+    project_root = git('rev-parse', '--show-toplevel')
+    if project_root:
+        workspace = Path(project_root).resolve()
+        identity = git('rev-parse', '--path-format=absolute', '--git-common-dir') or str(workspace)
+    else:
+        if args.project_root is None:
+            raise ValueError("non-Git workspaces require --project-root PATH")
+        workspace = args.project_root.expanduser().resolve()
+        if not workspace.is_dir() or not Path.cwd().is_relative_to(workspace):
+            raise ValueError("--project-root must be a directory containing the working directory")
+        identity = str(workspace)
+    if root.resolve().is_relative_to(workspace):
+        raise ValueError("keep private run state outside the project workspace")
     root.mkdir(parents=True, mode=0o700, exist_ok=True)
     info = root.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValueError("state root must be an owned private directory (0700), not a symlink")
-    project_root = git('rev-parse', '--show-toplevel')
-    if project_root and root.resolve().is_relative_to(Path(project_root).resolve()):
-        raise ValueError("keep private run state outside the project repository")
-    identity = git('rev-parse', '--path-format=absolute', '--git-common-dir') or str(Path.cwd())
     key = hashlib.sha256(os.fsencode(os.path.realpath(identity))).hexdigest()
     fd = os.open(root / ('repo-' + key + '.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, 'a') as lock:

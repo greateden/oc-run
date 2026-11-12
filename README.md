@@ -62,6 +62,8 @@ oc-run resume 2h --latest     # inspect interrupted work; give a new budget
 - Controls select only the current directory's active run, then its newest.
 - `handoff --latest` also allows historical runs from other directories.
 - `--dry-run` shows intent without starting OpenCode or creating state.
+- Non-Git workspaces require `--project-root /path/to/project` on start and resume.
+  Use the same root from nested directories. Controls still select runs by working directory.
 - `--push` permits checked, reviewed pushes. Off by default.
 - Durations: `s`, `m`, `h`. Bare numbers mean minutes.
 - Reported completion stops by default.
@@ -87,11 +89,17 @@ Private state lives in `~/.local/state/oc-run`, outside your project:
 | `*-work.jsonl` | Incremental native OpenCode events |
 | `journal.jsonl` | Session identity, requests, warnings and state transitions |
 
-Full output and incidents stay in logs. Oversized old snapshots remain readable;
-resume preserves the original in `legacy-state.json` before compacting it.
+Raw logs remain complete. Parsing skips records above 1 MiB and continues at the
+next newline. Summaries retain the last 65,536 text characters, 32 recent facts per kind
+and updates for 256 recent tool calls. Older call updates may count separately;
+inspect raw logs when a summary is limited. Invocation Markdown files are excerpts.
+Oversized old snapshots remain readable. Resume preserves the original in `legacy-state.json` before compacting it.
 
 Keep logs private: they may contain secrets. `OC_RUN_STATE_DIR` selects another
-private directory. Repository locks prevent overlapping workers.
+private directory outside the Git or declared non-Git workspace, including resolved
+symlink paths. Locks prevent overlapping workers using the same workspace identity
+and state directory. Git uses its common directory. Non-Git roots are explicit;
+separately declared overlapping roots cannot be detected. Unrelated roots remain independent.
 
 After a crash, resume preserves partial logs, reconstructs complete events and
 checks OpenCode's persisted session. The worker must inspect files, jobs and
