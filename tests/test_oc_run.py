@@ -536,6 +536,21 @@ class RunnerTests(unittest.TestCase):
             process.terminate(); process.communicate(timeout=10)
         self.assert_gone(child); self.assert_gone(other_child)
 
+    def test_guardian_cleans_descendant_after_immediate_child_exits(self):
+        reader, writer = os.pipe()
+        path = self.base / 'descendant.pid'
+        script = ("import subprocess,sys;from pathlib import Path;"
+                  "p=subprocess.Popen([sys.executable,'-c',"
+                  "'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(120)']);"
+                  "Path(sys.argv[1]).write_text(str(p.pid))")
+        proc = subprocess.Popen([sys.executable, str(ROOT / 'oc-run'), '_child', str(reader),
+                                 sys.executable, '-c', script, str(path)], pass_fds=(reader,), start_new_session=True)
+        os.close(reader)
+        try:
+            self.assertEqual(proc.wait(timeout=6), 0)
+            self.assert_gone(int(path.read_text()))
+        finally:
+            os.close(writer)
 
     def test_stop_delivery_reconciles_before_retry_and_reports_unknown(self):
         _, _, run, state = self.run_fake()

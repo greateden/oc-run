@@ -115,11 +115,11 @@ def send_group(pid, sig):
         pass
 
 
-def cleanup(proc):
+def cleanup(proc, grace=CLEANUP_SECONDS):
     """Cleanup is bounded; productive invocations have no timer."""
     send_group(proc.pid, signal.SIGTERM)
     try:
-        proc.wait(timeout=CLEANUP_SECONDS)
+        proc.wait(timeout=grace)
     except subprocess.TimeoutExpired:
         pass
     send_group(proc.pid, signal.SIGKILL)  # includes children after their leader exits
@@ -131,16 +131,22 @@ def cleanup(proc):
 
 def child_guard(fd, command):
     """A pipe closes even on runner SIGKILL. Only guardians retain lock leases; worker processes inherit none."""
-    signal.signal(signal.SIGINT, lambda *_: None)
-    signal.signal(signal.SIGTERM, lambda *_: None)
-    proc = subprocess.Popen(command, close_fds=True)
-    while proc.poll() is None:
-        ready, _, _ = select.select([fd], [], [], .1)
-        if ready and not os.read(fd, 1):
-            # We lead the group. Stay alive through TERM, then kill the whole group.
-            send_group(os.getpgrp(), signal.SIGTERM)
-            time.sleep(CLEANUP_SECONDS)
-            send_group(os.getpgrp(), signal.SIGKILL)
+    stopping = False
+    def stop(*_):
+        nonlocal stopping
+        stopping = True
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+    # Own a separate worker group so cleanup can kill descendants and still return
+    # the immediate child's exit code. The guardian retains the lock leases.
+    proc = subprocess.Popen(command, close_fds=True, start_new_session=True)
+    try:
+        while proc.poll() is None and not stopping:
+            ready, _, _ = select.select([fd], [], [], .1)
+            if ready and not os.read(fd, 1):
+                break
+    finally:
+        cleanup(proc)
     return proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
 
 
@@ -184,7 +190,7 @@ def guarded(command, output, message=None, env=None, leases=()):
         yield proc
     finally:
         if proc is not None:
-            cleanup(proc)
+            cleanup(proc, grace=CLEANUP_SECONDS + 2)  # let the guardian finish bounded worker cleanup
         os.close(writer)
         if reader is not None:
             os.close(reader)
