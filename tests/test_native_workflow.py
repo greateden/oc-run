@@ -41,6 +41,7 @@ class NativeWorkflow(unittest.TestCase):
                 title = 'You are a title generator' in json.dumps(messages[:1])
                 if not title:
                     case.requests.append(body)
+                    time.sleep(getattr(case, 'provider_delay', 0))
                 text = json.dumps(messages)
                 if '[oom]' in text:
                     self.send_response(400)

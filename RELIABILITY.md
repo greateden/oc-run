@@ -1,5 +1,11 @@
 # Controller retirement: 13 November 2026
 
+Historical retirement record, preserved below. The later explicit working-budget
+requirement is implemented by the minimal timer described in [README.md](README.md).
+See [ASSESSMENT.md](ASSESSMENT.md) and [VALIDATION.md](VALIDATION.md) for the new
+decision and executed checks. The advisory-deadline recommendation below is
+superseded; historical logs, backups and conclusions about research remain intact.
+
 ## Decision
 
 **Option A: remove oc-run from the active workflow.** There is no production

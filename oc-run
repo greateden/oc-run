@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Give one native OpenCode session more turns within a soft working budget."""
+
+import argparse
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+import uuid
+
+
+CONTINUATION = (
+    "Review the work completed so far, the remaining research opportunities and any "
+    "failures. Choose the most valuable next action consistent with the original "
+    "task and project instructions, then carry it out. Preserve existing evidence "
+    "and avoid repeating unsuccessful work without new information. Do not merely "
+    "produce another plan: perform useful work."
+)
+RAPID_SECONDS = 2
+RAPID_LIMIT = 3
+
+
+def duration(value):
+    """Parse positive s/m/h budgets; seconds also permit small fixture runs."""
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([smh])", value)
+    if match:
+        seconds = float(match[1]) * {"s": 1, "m": 60, "h": 3600}[match[2]]
+        if math.isfinite(seconds) and seconds > 0:
+            return seconds
+    raise argparse.ArgumentTypeError("use a positive duration such as 15m, 2h or 10h")
+
+
+def events(path):
+    """Read bounded JSON records; oversized payloads stay intact in the raw log."""
+    with path.open("rb") as stream:
+        while chunk := stream.readline(1024 * 1024):
+            if not chunk.endswith(b"\n"):
+                while chunk and not chunk.endswith(b"\n"):
+                    chunk = stream.readline(1024 * 1024)
+                continue
+            try:
+                event = json.loads(chunk)
+                if isinstance(event, dict):
+                    yield event
+            except (ValueError, UnicodeError):
+                continue
+
+
+def run(seconds, prompt, executable, logdir):
+    started = time.monotonic()
+    deadline = started + seconds
+    # The CLI accepts caller-supplied IDs and creates missing sessions. Knowing
+    # the ID beforehand also handles a successful empty turn with no events.
+    session = "ses_" + uuid.uuid4().hex
+    proc = None
+    stopped = 0
+    forwarded = False
+    rapid = 0
+    turns = 0
+    (logdir / "prompt.txt").write_text(prompt, encoding="utf-8")
+    (logdir / "session-id").write_text(session + "\n", encoding="utf-8")
+
+    with (logdir / "controller.log").open("a", encoding="utf-8", buffering=1) as journal:
+        def note(message):
+            line = f"+{time.monotonic() - started:.3f}s {message}"
+            journal.write(line + "\n")
+            print(line, flush=True)
+
+        def forward_interrupt():
+            nonlocal forwarded
+            if proc is not None and not forwarded and proc.poll() is None:
+                forwarded = True
+                try:
+                    proc.send_signal(signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+
+        def interrupt(signum, _frame):
+            nonlocal stopped
+            stopped = signum
+            forward_interrupt()
+            note("Stop requested; waiting for native OpenCode to settle. No more turns.")
+
+        handlers = {s: signal.signal(s, interrupt) for s in (signal.SIGINT, signal.SIGTERM)}
+        note(f"Logs: {logdir}")
+        note(f"Directory: {Path.cwd()}; budget: {seconds:g}s")
+        note(f"Session: {session} (OpenCode creates it on first invocation)")
+        try:
+            while not stopped and time.monotonic() < deadline:
+                number = turns + 1
+                stdout = logdir / f"{number:04d}.stdout.jsonl"
+                stderr = logdir / f"{number:04d}.stderr.log"
+                command = [executable, "run", "--standalone", "--format", "json", "--print-logs"]
+                command += ["--session", session]
+                # Check immediately before admission, including setup time in the budget.
+                with stdout.open("wb") as out, stderr.open("wb") as err:
+                    if stopped or time.monotonic() >= deadline:
+                        break
+                    turn_started = time.monotonic()
+                    note(f"Starting turn {number}; stdout: {stdout.name}")
+                    forwarded = False
+                    proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=out, stderr=err,
+                                            start_new_session=True)
+                    if stopped:
+                        forward_interrupt()
+                    # No timeout, deadline signal, retry, or step-level completion test.
+                    proc.communicate((prompt if turns == 0 else CONTINUATION).encode("utf-8"))
+                    code = proc.returncode
+                    proc = None
+                elapsed = time.monotonic() - turn_started
+                turns += 1
+                ids = set()
+                used_tool = failed = False
+                for event in events(stdout):
+                    sid = event.get("sessionID")
+                    if isinstance(sid, str) and re.fullmatch(r"ses_[A-Za-z0-9_-]+", sid):
+                        ids.add(sid)
+                    used_tool |= event.get("type") == "tool_use"
+                    failed |= event.get("type") == "error"
+                note(f"Turn {number}: exit {code}; {elapsed:.3f}s; session: {session}")
+                if stopped:
+                    return 128 + stopped
+                if code != 0 or failed:
+                    note("Stopped on native execution failure; inspect raw logs before resuming.")
+                    return code if 0 < code < 126 else 1
+                if ids - {session}:
+                    note("Stopped: session continuity is unconfirmed; no new turn was sent.")
+                    return 1
+                if time.monotonic() >= deadline:
+                    break
+                rapid = rapid + 1 if elapsed < RAPID_SECONDS and not used_tool else 0
+                if rapid >= RAPID_LIMIT:
+                    note("Stopped: three consecutive tool-free turns under two seconds each. "
+                         "Inspect the conversation before resuming.")
+                    return 1
+            note(f"{'Interrupted' if stopped else 'Budget elapsed'}; {turns} turn(s); no new turn.")
+            return 128 + stopped if stopped else 0
+        except OSError as error:
+            note(f"Stopped: {error}; logs preserved; no automatic retry.")
+            return 1
+        finally:
+            for signum, handler in handlers.items():
+                signal.signal(signum, handler)
+            note(f"Session: {session or 'unknown'}; logs: {logdir}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("duration", type=duration, help="working budget, e.g. 15m or 10h")
+    parser.add_argument("prompt", help="original task, passed unchanged to OpenCode")
+    args = parser.parse_args()
+    executable = shutil.which("opencode")
+    if not executable:
+        parser.error("opencode was not found on PATH")
+    state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "oc-run"
+    state.mkdir(parents=True, exist_ok=True)
+    logdir = Path(tempfile.mkdtemp(prefix=time.strftime("timer-%Y%m%dT%H%M%S-"), dir=state))
+    return run(args.duration, args.prompt, executable, logdir)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
