@@ -21,7 +21,9 @@ even if it overruns. No new turn starts after expiry. OpenCode owns execution,
 permissions, tools and provider retries. OC Run does not infer completion or
 retry failures; a non-zero CLI exit, native error event, or conflicting session
 ID stops the run. Empty answers are allowed. Three consecutive tool-free turns
-under two seconds stop with a warning.
+under two seconds stop with a warning and a non-zero exit. There is no per-turn
+timeout or workspace lock: a hung CLI can wait indefinitely, so run only one
+controller per checkout.
 
 ## Logs and interruption
 
@@ -34,7 +36,8 @@ Ctrl-C, SIGHUP and SIGTERM are forwarded once to the owned OpenCode CLI as the
 same signal; OC Run waits for it to settle and starts no more turns. Repeated
 signals do not force-kill OpenCode or change the first signal's exit status.
 Exit codes are 0 for budget expiry, 130 for Ctrl-C, 129 for SIGHUP, 143 for
-SIGTERM, 2 for invalid arguments and non-zero for execution failures.
+SIGTERM, 2 for invalid arguments and non-zero for execution failures or the
+rapid-turn safeguard.
 
 Resume or export the printed session from the project directory:
 
