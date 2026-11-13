@@ -29,10 +29,24 @@ with calls.open('a') as f: f.write(json.dumps(sys.argv[1:] + [sys.stdin.read()])
 print(json.dumps({'type': 'step_start', 'sessionID': sid}), flush=True)
 mode = os.environ.get('FIXTURE_MODE', '')
 if mode == 'interrupt':
-    def stop(*_):
-        print('interrupted natively', file=sys.stderr, flush=True)
-        sys.exit(130)
-    signal.signal(signal.SIGINT, stop)
+    def stop(signum, *_):
+        print(f'interrupted natively: {signum}', file=sys.stderr, flush=True)
+        sys.exit(128 + signum)
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, stop)
+    (root / 'work.txt').write_text('preserved')
+    (root / 'ready').touch()
+    time.sleep(30)
+if mode == 'repeat':
+    def stop(signum, *_):
+        with (root / 'signals.txt').open('a') as signals:
+            signals.write(f'{signum}\\n')
+        (root / 'ready').touch()
+        while not (root / 'release').exists():
+            time.sleep(.01)
+        sys.exit(128 + signum)
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, stop)
     (root / 'work.txt').write_text('preserved')
     (root / 'ready').touch()
     time.sleep(30)
@@ -168,7 +182,57 @@ class Timer(unittest.TestCase):
         self.assertEqual(proc.returncode, 129, out + err)
         self.assertEqual(len(self.calls()), 1)
         self.assertEqual((self.root / 'work.txt').read_text(), 'preserved')
-        self.assertIn('interrupted natively', (self.logs() / '0001.stderr.log').read_text())
+        self.assertIn(f'interrupted natively: {signal.SIGHUP}',
+                      (self.logs() / '0001.stderr.log').read_text())
+
+    def test_sigterm_preserves_logs_and_work(self):
+        proc = subprocess.Popen([sys.executable, str(WRAPPER), '10s', 'Original task'],
+                                env={**self.env, 'FIXTURE_MODE': 'interrupt'},
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            until = time.monotonic() + 5
+            while not (self.root / 'ready').exists() and time.monotonic() < until:
+                time.sleep(.01)
+            self.assertTrue((self.root / 'ready').exists())
+            proc.send_signal(signal.SIGTERM)
+            out, err = proc.communicate(timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.assertEqual(proc.returncode, 143, out + err)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual((self.root / 'work.txt').read_text(), 'preserved')
+        self.assertIn(f'interrupted natively: {signal.SIGTERM}',
+                      (self.logs() / '0001.stderr.log').read_text())
+
+    def test_repeated_signal_preserves_first_exit_code_and_forwards_once(self):
+        proc = subprocess.Popen([sys.executable, str(WRAPPER), '10s', 'Original task'],
+                                env={**self.env, 'FIXTURE_MODE': 'repeat'},
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            until = time.monotonic() + 5
+            while not (self.root / 'ready').exists() and time.monotonic() < until:
+                time.sleep(.01)
+            self.assertTrue((self.root / 'ready').exists())
+            proc.send_signal(signal.SIGINT)
+            until = time.monotonic() + 5
+            signals = self.root / 'signals.txt'
+            while not signals.exists() and time.monotonic() < until:
+                time.sleep(.01)
+            self.assertTrue(signals.exists(), 'first signal reached native CLI')
+            proc.send_signal(signal.SIGTERM)
+            (self.root / 'release').touch()
+            out, err = proc.communicate(timeout=5)
+        finally:
+            (self.root / 'release').touch()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.assertEqual(proc.returncode, 130, out + err)
+        self.assertEqual(signals.read_text().splitlines(), [str(signal.SIGINT)])
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual((self.root / 'work.txt').read_text(), 'preserved')
 
     def test_wall_clock_does_not_control_deadline(self):
         logdir = self.root / 'direct'

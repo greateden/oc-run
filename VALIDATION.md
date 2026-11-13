@@ -2,9 +2,25 @@
 
 ## Executed checks
 
-The pre-change baseline passed five installed-CLI tests (exit 0). The final suite
-passed **19 tests, no skips, exit 0, 24.731 seconds**, using `python3` and OpenCode
-`~/.opencode/bin/opencode` **2.0.28**:
+The initial timer-branch validation passed 19 tests. The post-review consolidation
+run passed **24 tests, no skips, exit 0, 26.643 seconds**, using `python3` and
+OpenCode `~/.opencode/bin/opencode` **2.0.28**. It includes the deterministic
+suite and installed-CLI loopback integration tests:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+For the installed-CLI run, a temporary synthetic `sage-research` agent was used:
+the research-agent path recorded in the earlier validation was no longer
+present. All provider responses came from the tests' loopback fixture; no model
+provider or research project was contacted or modified.
+The installed-CLI suite verified that SIGINT, SIGTERM and SIGHUP each reach the
+native CLI, preserve completed work and prevent another turn. Deterministic
+tests also verify that repeated signals are forwarded only once and retain the
+first signal's exit status.
+
+The original timer-branch validation used:
 
 Interpreter: `/Library/Frameworks/Python.framework/Versions/3.12/bin/python3`
 (Python **3.12.4**).

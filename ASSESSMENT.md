@@ -76,3 +76,16 @@ Source snapshots and repository metadata are retained locally under
 `~/.local/share/oc-run/timer-assessment-20261113/` for this assessment. Historical
 retirement evidence remains in `RELIABILITY.md` and Git; this decision supersedes
 its advisory-deadline recommendation.
+
+## GPU handoff deferred
+
+The fetched `feat/gpu-workload-handoff` tip is still its single original commit,
+`bcf4f53`; it has no follow-up fixes. Its tests cover a happy-path lifecycle, not
+the previously identified reliability concerns. In particular, a failed health
+probe is treated as proof that the model server stopped; training descendants
+are not supervised as a process tree; interruption and intermediate failures
+can leave restoration uncertain; training logs are opened with truncation; and
+a failed training exit can still result in a successful OC Run exit. Session
+creation is also not verified before continuing. These lifecycle risks are not
+addressed by small, demonstrated fixes, so GPU handoff is excluded rather than
+merged. The original commit is retained separately in Git history.

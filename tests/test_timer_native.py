@@ -107,19 +107,28 @@ class NativeTimer(unittest.TestCase):
         self.assertIn('fixture provider out of memory', (self.logdir / '0001.stdout.jsonl').read_text())
         self.export()
 
-    def test_ctrl_c_uses_native_interruption_and_preserves_work(self):
+    def assert_interrupted_by(self, signum, exit_code):
         proc = self.launch('10s', '[interrupt]')
         try:
             self.assertTrue(self.blocked.wait(10))
-            proc.send_signal(signal.SIGINT)
-            code, out, err = self.finish(proc)
+            proc.send_signal(signum)
         finally:
             self.release.set()
-        self.assertEqual(code, 130, out + err)
+        code, out, err = self.finish(proc)
+        self.assertEqual(code, exit_code, out + err)
         self.assertEqual((self.project / 'interrupted.txt').read_text(), 'preserved before interruption')
         self.assertIn('tool_use', (self.logdir / '0001.stdout.jsonl').read_text())
         self.assertEqual(len(list(self.logdir.glob('*.stdout.jsonl'))), 1)
         self.export()
+
+    def test_ctrl_c_uses_native_interruption_and_preserves_work(self):
+        self.assert_interrupted_by(signal.SIGINT, 130)
+
+    def test_sigterm_is_forwarded_and_preserves_work(self):
+        self.assert_interrupted_by(signal.SIGTERM, 143)
+
+    def test_sighup_is_forwarded_and_preserves_work(self):
+        self.assert_interrupted_by(signal.SIGHUP, 129)
 
 
 if __name__ == '__main__':

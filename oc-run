@@ -72,19 +72,22 @@ def run(seconds, prompt, executable, logdir):
             journal.write(line + "\n")
             print(line, flush=True)
 
-        def forward_interrupt():
+        def forward_interrupt(signum):
             nonlocal forwarded
             if proc is not None and not forwarded and proc.poll() is None:
                 forwarded = True
                 try:
-                    proc.send_signal(signal.SIGINT)
+                    proc.send_signal(signum)
                 except ProcessLookupError:
                     pass
 
         def interrupt(signum, _frame):
             nonlocal stopped
+            if stopped:
+                note(f"Additional stop signal {signum} received; still waiting for native OpenCode.")
+                return
             stopped = signum
-            forward_interrupt()
+            forward_interrupt(signum)
             note("Stop requested; waiting for native OpenCode to settle. No more turns.")
 
         handlers = {s: signal.signal(s, interrupt) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)}
@@ -108,7 +111,7 @@ def run(seconds, prompt, executable, logdir):
                     proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=out, stderr=err,
                                             start_new_session=True)
                     if stopped:
-                        forward_interrupt()
+                        forward_interrupt(stopped)
                     # No timeout, deadline signal, retry, or step-level completion test.
                     proc.communicate((prompt if turns == 0 else CONTINUATION).encode("utf-8"))
                     code = proc.returncode
