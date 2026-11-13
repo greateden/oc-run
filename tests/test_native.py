@@ -1,6 +1,8 @@
 """Opt-in installed OpenCode tests with local fixtures; no live-model inference."""
 import os
 import json
+import subprocess
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import tempfile
@@ -10,11 +12,79 @@ import unittest
 import uuid
 from unittest import mock
 
-from test_oc_run import oc
+from test_oc_run import ROOT, oc
 
 
 @unittest.skipUnless(os.environ.get('OC_RUN_NATIVE_BIN'), 'set OC_RUN_NATIVE_BIN for the installed CLI API test')
 class NativeTests(unittest.TestCase):
+    def test_controller_repairs_final_using_project_agent_and_same_session(self):
+        """Real installed CLI/server/tools; deterministic loopback provider, no Sage inference."""
+        requests = []
+        report = {'decision': 'STOP', 'complete': False, 'reason': 'Fixture handoff',
+                  'summary': 'Read existing fixture; no research performed.',
+                  'evidence': ['shell printf: 12'], 'next': 'Review fixture'}
+        class Provider(BaseHTTPRequestHandler):
+            def log_message(self, *_): pass
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                title = 'You are a title generator' in json.dumps(body.get('messages', [])[:1])
+                if not title:
+                    requests.append(body)
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.end_headers()
+                if title:
+                    delta, finish = {'role': 'assistant', 'content': 'Fixture'}, 'stop'
+                elif len(requests) == 1:
+                    delta = {'role': 'assistant', 'tool_calls': [{'index': 0, 'id': 'call_fixture',
+                        'type': 'function', 'function': {'name': 'shell',
+                        'arguments': json.dumps({'command': 'printf 12'})}}]}
+                    finish = 'tool_calls'
+                else:
+                    text = 'printf unexecuted-command' if len(requests) == 2 else 'OC_RUN_RESULT ' + json.dumps(report)
+                    delta, finish = {'role': 'assistant', 'content': text}, 'stop'
+                for item, reason in ((delta, None), ({}, finish)):
+                    data = {'id': 'fixture', 'object': 'chat.completion.chunk', 'created': 1, 'model': 'mock',
+                            'choices': [{'index': 0, 'delta': item, 'finish_reason': reason}]}
+                    self.wfile.write(('data: ' + json.dumps(data) + '\n\n').encode())
+                self.wfile.write(b'data: [DONE]\n\n')
+        provider = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
+        threading.Thread(target=provider.serve_forever, daemon=True).start()
+        self.addCleanup(provider.server_close)
+        self.addCleanup(provider.shutdown)
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            project = base / 'project'; project.mkdir()
+            config = project / 'opencode.json'
+            config.write_text(json.dumps({'model': 'fixture/mock', 'small_model': 'fixture/mock',
+                'default_agent': 'fixture-research',
+                'provider': {'fixture': {'npm': '@ai-sdk/openai-compatible',
+                    'options': {'baseURL': f'http://127.0.0.1:{provider.server_port}/v1', 'apiKey': 'fixture'},
+                    'models': {'mock': {'name': 'mock', 'limit': {'context': 32768, 'output': 4096}}}}},
+                'permission': {'*': 'allow'}}))
+            agents = project / '.opencode' / 'agents'; agents.mkdir(parents=True)
+            (agents / 'fixture-research.md').write_text('---\nmode: primary\ndescription: Native test\n---\nOC_RUN_PROJECT_AGENT_MARKER\n')
+            env = {**os.environ, 'OC_RUN_BIN': os.environ['OC_RUN_NATIVE_BIN'],
+                   'OC_RUN_STATE_DIR': str(base / 'state'), 'OPENCODE_CONFIG': str(config),
+                   'XDG_CONFIG_HOME': str(base / 'config'), 'XDG_DATA_HOME': str(base / 'data'),
+                   'XDG_CACHE_HOME': str(base / 'cache'), 'NO_COLOR': '1'}
+            proc = subprocess.run([sys.executable, str(ROOT / 'oc-run'), '30s',
+                '--project-root', str(project), 'Read fixture and report incomplete.'], cwd=project,
+                env=env, capture_output=True, text=True, timeout=45)
+            self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+            run = next(p for p in (base / 'state').iterdir() if p.is_dir())
+            state = json.loads((run / 'run.json').read_text())
+            self.assertEqual(state['invocations'], 2, (state, (run / '0001-work.jsonl').read_text()[-4000:]))
+            self.assertGreater(state['successful_tools'], 0)
+            self.assertEqual(len(requests), 3)
+            self.assertTrue(all('OC_RUN_PROJECT_AGENT_MARKER' in json.dumps(x) for x in requests))
+            journal = [json.loads(x) for x in (run / 'journal.jsonl').read_text().splitlines()]
+            checked = next(x for x in journal if x['kind'] == 'recovery_checked')
+            self.assertEqual(checked['session'], state['session'])
+            sessions = [x['session'] for x in journal if x['kind'] == 'session']
+            self.assertEqual(sessions, [state['session']])
+            self.assertIn('printf unexecuted-command', (run / '0001-work.md').read_text())
+
     def test_durable_steering_inbox_survives_private_server_restart(self):
         binary = os.environ['OC_RUN_NATIVE_BIN']
         with tempfile.TemporaryDirectory() as tmp:

@@ -16,6 +16,38 @@ from test_oc_run import ROOT, oc
 
 
 class ReliabilityTests(unittest.TestCase):
+    def test_error_classification_does_not_retry_arbitrary_ooms(self):
+        error = {'type': 'provider.internal', 'message': 'insufficient memory'}
+        self.assertFalse(oc.retryable_error(error))
+        for kind in ('provider.auth', 'provider.quota', 'provider.invalid-request', 'unknown'):
+            self.assertFalse(oc.retryable_error({'type': kind, 'message': 'retry please'}))
+        self.assertTrue(oc.retryable_error({'type': 'provider.transport', 'message': 'connection closed'}))
+        # Historical Sage event, with provider body omitted (not needed for classification).
+        self.assertTrue(oc.retryable_error({'type': 'provider.internal', 'status': 200,
+            'message': 'insufficient memory: the request exceeded available GPU memory '
+            '(the Mac ran out of free memory during prefill (other apps hold the rest); '
+            'aborted before the desktop started to swap). The engine shed its caches and '
+            'stays up; this request failed. Reduce --context-window, close other apps, or try q8 KV quantization.'}))
+
+    def test_recovery_check_fails_closed_on_missing_native_fields(self):
+        server = mock.Mock()
+        for response in ({}, None, {'data': None}, {'data': {'id': 'wrong'}}):
+            server.request.return_value = response
+            with self.assertRaisesRegex(ValueError, 'recovery refused'):
+                oc.check_recovery(server, 'ses_fixture')
+
+    def test_historical_nested_timeout_is_uncertain_even_without_exit(self):
+        summary = oc.EventSummary()
+        # Sanitised native V2 shape: tool completion is distinct from process completion.
+        summary.consume({'type': 'tool_use', 'sessionID': 'ses_fixture', 'part': {
+            'partID': 'prt_fixture', 'id': 'call_fixture', 'tool': 'shell', 'state': {
+                'status': 'completed', 'input': {'command': 'fixture'}, 'output': 'timed out',
+                'metadata': {'metadata': {'timeout': True, 'truncated': False}}}}})
+        facts = summary.finish()
+        self.assertEqual(facts['successful_tools'], 0)
+        self.assertEqual(len(facts['failures']), 1)
+        self.assertTrue(facts['unsafe_tools'])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

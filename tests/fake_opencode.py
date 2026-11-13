@@ -16,8 +16,14 @@ if len(sys.argv) > 1 and sys.argv[1] == 'serve':
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_): pass
         def do_GET(self):
-            data = {'id': 'ses_fixture'}
-            if self.path.endswith('/inbox'):
+            data = {'id': 'ses_fixture', 'location': {'directory': str(Path.cwd())}, 'agent': 'sage-research'}
+            if self.path == '/api/session/active':
+                data = {'ses_fixture': {'type': 'running'}} if scenario == 'active_recovery' else {}
+            elif self.path.startswith('/api/session?'):
+                data = [{'id': 'ses_child'}] if scenario == 'child_recovery' else []
+            elif self.path.startswith('/api/shell?'):
+                data = [{'id': 'sh_live', 'status': 'running'}] if scenario == 'shell_recovery' else []
+            elif self.path.endswith('/inbox'):
                 data = list(inbox.values())
                 if scenario == 'stale_control':
                     run = next(p for p in Path(os.environ['OC_RUN_STATE_DIR']).iterdir() if p.is_dir())
@@ -53,6 +59,8 @@ if len(sys.argv) > 1 and sys.argv[1] == 'serve':
     server.serve_forever()
 
 prompt = sys.stdin.read()
+previous = Path('prompts.txt').read_text().count('\n---\n') if Path('prompts.txt').exists() else 0
+Path('arguments.json').write_text(json.dumps(sys.argv[1:]))
 session = "ses_fixture"
 if "--session" in sys.argv:
     assert sys.argv[sys.argv.index("--session") + 1] == session
@@ -73,6 +81,25 @@ def tool(name, inputs, output, bad=False):
 
 
 emit("step_start")
+recovery = scenario in ('oom', 'oom_repeat', 'unsafe_oom', 'transport_recovery', 'auth_failure',
+                        'active_recovery', 'child_recovery', 'shell_recovery')
+if recovery:
+    if previous == 0:
+        Path('experiment.txt').write_text('unique completed result\n')
+        tool('shell', {'command': 'one experiment'}, 'unique completed result')
+    if previous == 0 or scenario == 'oom_repeat':
+        if scenario == 'unsafe_oom':
+            emit('tool_use', {'id': 'call_timeout', 'tool': 'shell', 'state': {
+                'status': 'completed', 'input': {'command': 'uncertain experiment'},
+                'output': 'Command timed out', 'metadata': {'metadata': {'timeout': True}}}})
+        error = {'type': 'provider.internal', 'message': 'insufficient memory: the request exceeded available GPU memory during prefill. The engine shed its caches and stays up; this request failed.',
+                 'status': 200, 'response': {'body': '{"error":{"code":"insufficient_memory"}}'}}
+        if scenario == 'transport_recovery':
+            error = {'type': 'provider.transport', 'message': 'Connection lost while reading the response'}
+        if scenario == 'auth_failure':
+            error = {'type': 'provider.auth', 'message': 'Unauthorised', 'status': 401}
+        emit('error', error=error)
+        sys.exit(1)
 if scenario == 'bad_events':
     emit('tool_use', {'state': {'metadata': 'unexpected'}})
     emit('tool_use', {'state': ['unexpected']})
@@ -116,13 +143,19 @@ if scenario == 'milestones':
     for i in range(3):
         emit('text', {'text': f'Milestone {i} complete; continuing without review.'})
         tool('read', {'path': 'facts.txt'}, str(i))
-if scenario == "malformed":
+if scenario == 'handoff_stall' and previous:
+    time.sleep(30)
+if scenario == "malformed" or (scenario in ('repair_final', 'repair_invalid', 'handoff_stall') and previous == 0):
+    emit('text', {'text': 'cd /research && run-experiment'})
     emit("text", {"text": "Milestone complete; not a valid final result"})
+    sys.exit(0)
+if scenario == 'repair_invalid':
+    emit('text', {'text': 'OC_RUN_RESULT {"decision":"STOP"}'})
     sys.exit(0)
 report = {"decision": "STOP", "complete": True, "reason": "Required work checked",
           "summary": "Completed: read/write fixture. Failed: unavailable tool; later read succeeded. Unverified: none in fixture.",
           "evidence": ["read answer.txt: 12"], "next": "none"}
-if scenario == 'incomplete':
+if scenario in ('incomplete', 'repair_final'):
     report['complete'] = False
 if scenario == 'no_evidence':
     report['evidence'] = []

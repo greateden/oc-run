@@ -201,6 +201,98 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(code, 1, output)
         self.assertTrue((self.project / "answer.txt").exists())
         self.assertIn("Milestone complete", (run / "HANDOFF.md").read_text())
+        self.assertEqual(state['invocations'], 2)
+
+    def test_missing_final_gets_one_handoff_only_attempt(self):
+        code, output, run, state = self.run_fake('repair_final', '15s', 'fixture')
+        self.assertEqual(code, 3, output)
+        self.assertEqual(state['status'], 'incomplete')
+        self.assertEqual(state['invocations'], 2)
+        prompts = (self.project / 'prompts.txt').read_text().split('\n---\n')
+        self.assertIn('HANDOFF ONLY', prompts[1])
+        self.assertIn('Do not execute tools', prompts[1])
+        self.assertIn('cd /research', (run / '0001-work.md').read_text())
+        self.assertNotIn('--agent', json.loads((self.project / 'arguments.json').read_text()))
+        self.assertNotIn('--model', json.loads((self.project / 'arguments.json').read_text()))
+
+    def test_invalid_contract_also_gets_only_one_repair(self):
+        code, output, run, state = self.run_fake('repair_invalid', '15s', 'fixture')
+        self.assertEqual(code, 1, output)
+        self.assertEqual(state['invocations'], 2)
+        self.assertIn('completion unverified', (run / 'HANDOFF.md').read_text())
+
+    def test_provider_recovery_preserves_completed_experiment(self):
+        for scenario in ('oom', 'transport_recovery'):
+            with self.subTest(scenario=scenario):
+                (self.project / 'prompts.txt').unlink(missing_ok=True)
+                code, output, run, state = self.run_fake(scenario, '15s', 'fixture')
+                self.assertEqual(code, 0, output)
+                self.assertEqual(state['invocations'], 2)
+                self.assertEqual((self.project / 'experiment.txt').read_text(), 'unique completed result\n')
+                self.assertIn('recovery_checked', (run / 'journal.jsonl').read_text())
+                self.assertIn('provider.', (run / 'HANDOFF.md').read_text())
+
+    def test_repeated_oom_stops_after_two_retries(self):
+        code, output, run, state = self.run_fake('oom_repeat', '20s', 'fixture')
+        self.assertEqual(code, 1, output)
+        self.assertEqual(state['invocations'], 3)
+        self.assertIn('recovery exhausted', state['reason'])
+        self.assertEqual((self.project / 'experiment.txt').read_text(), 'unique completed result\n')
+
+    def test_unsafe_recovery_and_permanent_errors_do_not_retry(self):
+        for scenario in ('unsafe_oom', 'auth_failure', 'active_recovery', 'child_recovery', 'shell_recovery'):
+            with self.subTest(scenario=scenario):
+                (self.project / 'prompts.txt').unlink(missing_ok=True)
+                code, output, run, state = self.run_fake(scenario, '15s', 'fixture')
+                self.assertEqual(code, 1, output)
+                self.assertEqual(state['invocations'], 1)
+                self.assertTrue((run / 'HANDOFF.md').exists())
+
+    def test_deadline_prevents_provider_retry(self):
+        code, output, run, state = self.run_fake('oom', '0.2s', 'fixture')
+        self.assertEqual(code, 1, output)
+        self.assertEqual(state['invocations'], 1)
+        self.assertIn('stop/deadline', state['reason'])
+
+    def test_handoff_opportunity_has_its_own_bound(self):
+        runner = self.base / 'bounded-runner'
+        runner.write_text((ROOT / 'oc-run').read_text().replace('HANDOFF_SECONDS = 120', 'HANDOFF_SECONDS = 0.2'))
+        proc = subprocess.run([sys.executable, str(runner), '15s', 'fixture'], cwd=self.project,
+            env={**self.env, 'FAKE_SCENARIO': 'handoff_stall'}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        run = next(p for p in self.state.iterdir() if p.is_dir())
+        self.assertIn('handoff time limit', (run / 'HANDOFF.md').read_text())
+        self.assertTrue((self.project / 'answer.txt').exists())
+        self.assertFalse(oc.active(run))
+
+    def test_interruption_during_backoff_preserves_completed_work(self):
+        proc = self.launch('oom', '15s', 'fixture')
+        self.wait_file('experiment.txt')
+        run = next(p for p in self.state.iterdir() if p.is_dir())
+        until = time.monotonic() + 5
+        while 'recovery_wait' not in (run / 'journal.jsonl').read_text() and time.monotonic() < until:
+            time.sleep(.03)
+        self.assertIn('recovery_wait', (run / 'journal.jsonl').read_text())
+        proc.send_signal(signal.SIGINT)
+        output, _ = proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 130, output)
+        state = json.loads((run / 'run.json').read_text())
+        self.assertEqual(state['invocations'], 1)
+        self.assertEqual(state['successful_tools'], 1)
+        self.assertIn('unique completed result', (self.project / 'experiment.txt').read_text())
+
+    def test_recovery_does_not_touch_unrelated_process_or_outputs(self):
+        unrelated = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], start_new_session=True)
+        try:
+            frozen = self.project / 'frozen-result.bin'
+            frozen.write_bytes(b'original scientific output\x00')
+            code, output, run, state = self.run_fake('oom', '15s', 'fixture')
+            self.assertEqual(code, 0, output)
+            self.assertEqual(frozen.read_bytes(), b'original scientific output\x00')
+            self.assertIsNone(unrelated.poll())
+        finally:
+            unrelated.terminate()
+            unrelated.wait(timeout=5)
 
     def test_git_dirty_and_push_authorisation(self):
         subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.project, check=True)

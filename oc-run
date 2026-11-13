@@ -21,6 +21,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 import uuid
 
 CLEANUP_SECONDS = 3
@@ -28,6 +29,8 @@ MAX_EVENT_BYTES = 1024 * 1024
 SUMMARY_ITEMS = 32
 RECENT_CALLS = 256
 TEXT_LIMIT = 64 * 1024
+RECOVERY_DELAYS = (2, 4)
+HANDOFF_SECONDS = 120
 
 
 def atomic_write(path, text):
@@ -377,16 +380,58 @@ def event_fields(event):
     return values
 
 
+def retryable_error(error):
+    """Only known transient provider failures qualify; an OOM alone is insufficient."""
+    if not isinstance(error, dict):
+        return False
+    if error.get('type') in ('provider.transport', 'provider.timeout'):
+        return True
+    message = str(error.get('message', '')).lower()
+    return (error.get('type') == 'provider.internal' and 'during prefill' in message
+            and 'shed its caches and stays up' in message and 'insufficient memory' in message)
+
+
+def check_recovery(server, session):
+    """Fail closed before resubmitting to the same idle, child-free native session.
+
+    Native V2 checks cover managed work only. Detached processes still require
+    the worker's inspection; no experiment or timed-out tool is replayed here.
+    """
+    def data(path):
+        response = server.request(path)
+        if not isinstance(response, dict) or 'data' not in response:
+            raise ValueError('recovery refused: invalid native response')
+        return response['data']
+
+    native = data(f'session/{session}')
+    if not isinstance(native, dict) or native.get('id') != session:
+        raise ValueError('recovery refused: original session unavailable')
+    active = data('session/active')
+    children = data('session?' + urllib.parse.urlencode({'parentID': session, 'limit': 1}))
+    inbox = data(f'session/{session}/inbox')
+    location = native.get('location')
+    location = location.get('directory') if isinstance(location, dict) else None
+    if not isinstance(location, str) or Path(location).resolve() != Path.cwd():
+        raise ValueError('recovery refused: session location changed or unavailable')
+    shells = data('shell?' + urllib.parse.urlencode({'location[directory]': location}))
+    if (not isinstance(active, dict) or not all(isinstance(x, list) for x in (children, inbox, shells))
+            or active or children or inbox or shells):
+        raise ValueError('recovery refused: active, child, queued or shell work, or invalid native response; inspect before resuming')
+    return native
+
+
 class EventSummary:
     """Recent facts only; complete output remains in the raw invocation log."""
     def __init__(self):
-        self.result = {"session": None, "text": "", "successful_tools": 0}
+        self.result = {"session": None, "text": "", "successful_tools": 0,
+                       "retryable": True, "unsafe_tools": False}
         self.result.update({key: deque(maxlen=SUMMARY_ITEMS)
                             for key in ('failures', 'successes', 'errors', 'diagnostics')})
         self.calls = {}
         self.limited = False
 
     def settle(self, record, bad):
+        self.result['unsafe_tools'] |= record.pop('uncertain', False)
         if bad or record['status'] != 'completed':
             self.result['failures'].append(record)
         else:
@@ -396,13 +441,16 @@ class EventSummary:
     def consume(self, event):
         result = self.result
         if event is None:
+            result['unsafe_tools'] = True
             result['diagnostics'].append('oversized event skipped; inspect raw log')
             return
         if isinstance(event, dict) and event.get('type') == 'error':
+            result['retryable'] &= retryable_error(event.get('error'))
             result['errors'].append(str(event.get('error', event))[:1000])
         try:
             part, state, meta, detail = event_fields(event)
         except ValueError as exc:
+            result['unsafe_tools'] = True
             result['diagnostics'].append(f'malformed event: {exc}; inspect raw log')
             return
         result['session'] = event.get('sessionID') or result['session']
@@ -412,13 +460,17 @@ class EventSummary:
             result['text'] = text[-TEXT_LIMIT:]
         if event.get('type') == 'tool_use':
             code = meta.get('exit', detail.get('exit'))
-            bad = (state.get('status') == 'error' or code not in (None, 0)
+            uncertain = (state.get('status') not in ('completed', 'error')
+                         or any(m.get('timeout') or m.get('signal') or m.get('status') == 'running'
+                                for m in (meta, detail)))
+            bad = (state.get('status') == 'error' or code not in (None, 0) or uncertain
                    or meta.get('error') is True or detail.get('error') is True)
             call_id = part.get('callID') or part.get('id')
             record = {'id': excerpt(call_id, 200) if call_id else None,
                       'tool': excerpt(part.get('tool', ''), 200),
                       'input': excerpt(json.dumps(state.get('input')), 1000),
                       'status': str(state.get('status'))[:100],
+                      'uncertain': uncertain,
                       'detail': str(state.get('error') or state.get('output', ''))[:1000]}
             # Latest update wins within a bounded recent-call window.
             key = hashlib.sha256(call_id.encode()).digest() if call_id else object()
@@ -611,6 +663,10 @@ OC_RUN_RESULT {"decision":"STOP","complete":false,"reason":"why","summary":"hand
 Set complete=true only if every requested requirement is supported by evidence.
 """
 STOP = "STOP: finish the active action safely, preserve results and give the final handoff. Start no substantial new work.\n" + RESULT
+HANDOFF = ("HANDOFF ONLY: the previous invocation ended without a valid final result. "
+           "Do not execute tools, shell commands or experiments. Do not replay the command "
+           "printed as text. Use existing session evidence only; mark missing checks and "
+           "unfinished work incomplete. Return the final result contract now.\n" + RESULT)
 
 
 def recover(run, state):
@@ -730,8 +786,13 @@ def execute(args, binary, root, run=None, repo_lock=None):
         journal(run, 'invocation_started', name=name, session=state['session'])
         save(run, state)
         summary = EventSummary()
+        until = time.monotonic() + HANDOFF_SECONDS if phase == 'handoff' else None
+        def call_tick():
+            tick()
+            if until is not None and time.monotonic() >= until:
+                raise ValueError('handoff time limit ended; completion unverified')
         try:
-            rc = invoke(binary, prompt, run, name, state['session'], tick, observe, server, leases, summary)
+            rc = invoke(binary, prompt, run, name, state['session'], call_tick, observe, server, leases, summary)
         finally:
             facts = summary.finish()
             state['successful_tools'] += facts['successful_tools']
@@ -743,9 +804,9 @@ def execute(args, binary, root, run=None, repo_lock=None):
         journal(run, 'invocation_ended', name=name, exit=rc)
         if rc != 0 or facts['errors']:
             incident(run, state, f"{name}: process exit={rc}; work may still be useful.")
-            raise ValueError("OpenCode invocation failed; inspect logs before resuming")
         if not state['session']:
             raise ValueError("OpenCode emitted no session ID; inspect the raw log")
+        facts['exit'] = rc
         return facts
 
     try:
@@ -774,13 +835,45 @@ def execute(args, binary, root, run=None, repo_lock=None):
                     prompt += ("RECOVERY: inspect prior logs, files, native session and active jobs first. "
                                "Do not repeat non-idempotent actions whose result is uncertain.\n" +
                                excerpt(json.dumps(state['incidents'][-12:])) + "\n" + excerpt(state.get('last_work', '')))
-                work = call('work', STOP + common if stopped else prompt)
-                if stopped and 'OC_RUN_RESULT ' not in work['text']:
-                    work = call('handoff', common + STOP)
-                result = work['text'].rsplit('OC_RUN_RESULT ', 1)
-                report = final_report(result[-1]) if len(result) == 2 else None
-                if report is None:
-                    raise ValueError("final result missing or invalid; useful work preserved, completion unverified")
+                phase, repaired = 'work', False
+                prompt = STOP + common if stopped else prompt
+                for attempt in range(len(RECOVERY_DELAYS) + 1):
+                    work = call(phase, prompt)
+                    failed = work['exit'] != 0 or bool(work['errors'])
+                    result = work['text'].rsplit('OC_RUN_RESULT ', 1)
+                    report = final_report(result[-1]) if len(result) == 2 else None
+                    if not failed and report is not None:
+                        break
+                    reason = ("OpenCode invocation failed" if failed else "final result missing or invalid")
+                    if (attempt == len(RECOVERY_DELAYS) or (failed and
+                            (work['exit'] not in (0, 1) or not work['errors'] or not work['retryable']))
+                            or (not failed and repaired)):
+                        raise ValueError(reason + '; recovery exhausted or unsafe; useful work preserved, completion unverified')
+                    if work['unsafe_tools']:
+                        raise ValueError(reason + '; recovery refused after uncertain/timed-out tools; inspect jobs before resuming')
+                    # Backoff remains interruptible and observes stop/deadline requests.
+                    save(run, state)
+                    journal(run, 'recovery_wait', attempt=attempt + 1, reason=reason, delay=RECOVERY_DELAYS[attempt])
+                    print(f'oc-run: {reason}; checking bounded same-session recovery', flush=True)
+                    until = time.monotonic() + RECOVERY_DELAYS[attempt]
+                    while time.monotonic() < until:
+                        tick()
+                        time.sleep(min(.1, max(0, until - time.monotonic())))
+                    tick()
+                    if failed and stopped:
+                        raise ValueError(reason + '; stop/deadline prevents another provider attempt; inspect logs before resuming')
+                    native = check_recovery(server, state['session'])
+                    journal(run, 'recovery_checked', session=state['session'], agent=native.get('agent'),
+                            model=native.get('model'), attempt=attempt + 1)
+                    if not failed:
+                        phase, repaired = 'handoff', True
+                    if phase == 'handoff':
+                        prompt = HANDOFF
+                    else:
+                        prompt = ("RECOVERY: the previous provider request failed. Continue this same session. "
+                                  "First inspect existing outputs and active jobs with lightweight read-only tools. "
+                                  "Do not repeat completed experiments or uncertain actions; do not change provider settings. "
+                                  "If memory headroom or job ownership is unclear, stop and report incomplete.\n" + RESULT)
                 state['review'] = report
                 if report['complete'] and (not report['evidence'] or not state['successful_tools']):
                     report.update(complete=False, reason="Completion lacks observed supporting tool evidence; unverified.")
