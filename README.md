@@ -1,135 +1,49 @@
-# OC Run
+# OC Run: working-budget GPU handoff
 
-Give [OpenCode](https://opencode.ai/) a task and a working budget.
-Let it work continuously. Check progress, request a safe stop, then resume later.
+This branch is an isolated replacement for the old remote `main` controller. It is **not** the user's newer, unpushed local 168-line build. Do not merge or install it without comparing that local build first.
 
-A small Python controller for long coding and research tasks.
-One worker. No milestone review calls.
+`oc-run 10h "Research ..."` uses one native OpenCode session until the working budget ends. It never stops a healthy active turn at the deadline.
 
-```mermaid
-flowchart TD
-    U["User controls<br/>start · status · stop · resume"] --> C["OC Run"]
-    C --> W["Worker: OpenCode<br/>One continuous session"]
-    W --> J[("Private event journal<br/>Raw events + control decisions")]
-    C --> J
-    W --> O["Event observer<br/>Warn on repeated identical failures"]
-    O -. "Steer at the next step boundary" .-> W
-    S["Independent model supervisor<br/>Not shipped: concurrency unverified"]
-    classDef work fill:#d7f0df,stroke:#24613b,color:#123820
-    classDef control fill:#deebf7,stroke:#365c85,color:#18334d
-    classDef caution fill:#fff0c2,stroke:#8a6400,color:#493600
-    class W,J work
-    class U,C control
-    class O,S caution
-    style S stroke-dasharray: 5 5
+## Optional GPU handoff
+
+[MTPLX](https://mtplx.ai/docs/quickstart/) supports `mtplx stop` and `mtplx serve`, but has **no model unload/reload HTTP endpoint**. GPU handoff is therefore opt-in, for a model server used exclusively by this research job. It does not modify any installed MTPLX settings or infer the restart command.
+
+Write a private lifecycle file outside Git, with your **actual known-good startup command** including every important model and precision setting:
+
+```json
+{
+  "exclusive": true,
+  "model_id": "your-current-served-model-id",
+  "health": "http://127.0.0.1:8000/health",
+  "stop": ["mtplx", "stop"],
+  "start": ["mtplx", "serve", "--host", "127.0.0.1", "--port", "8000", "--model", "/absolute/path/to/existing/model"]
+}
 ```
 
-The observer uses tool outcomes, not private reasoning or model calls.
-Independent model supervision is not included.
+**Do not use this illustrative start command verbatim**: preserve BF16, unquantised KV and any other options from your verified existing invocation. Check `mtplx serve --help` on your installed version first. Avoid storing access tokens in the lifecycle file. Keep the file private (`chmod 600`). The setting `exclusive: true` confirms that stopping MTPLX will not disrupt other users or clients.
 
-## Quick start
-
-Needs macOS or Linux, Python 3.10+, Git and a configured OpenCode provider.
-Tested with OpenCode 2.0.28's native V2 APIs.
-
-Inspect this checkout, then install the local executable:
+Run:
 
 ```sh
-mkdir -p ~/.local/bin
-install -m 755 oc-run ~/.local/bin/oc-run
+oc-run --gpu-lifecycle /private/path/mtplx-lifecycle.json 15m "Research ..."
 ```
 
-Keep `~/.local/bin` on your PATH. Back up any old installation. In your project:
+The initial prompt explains the handoff to Sage. When Sage decides to train, it must finish preparation, then call this from an OpenCode shell tool **without launching any process in the background**:
 
 ```sh
-oc-run 10h "Research and improve this project"
+oc-run train -- .venv/bin/python scripts/finetune_asr.py --device mps ...
 ```
 
-Your model, tools and permissions stay configured as before.
-The budget requests a handoff. No fixed rounds or silence timeouts.
+The `train` command registers a request and exits immediately; it does **not** start training. Sage must then end its OpenCode turn. OC Run stops MTPLX, confirms its server is down, runs the training command as a tracked subprocess and waits for completion. It restores the model service and checks `/health` and `/v1/models` before resuming the **same OpenCode session**, provided working time remains. Training time counts towards the budget.
 
-## Commands
+State and logs remain under `~/.local/state/oc-run`. Training logs, the request and the exit code are retained. If training is interrupted and remains alive, restoration is deliberately withheld to avoid competing for unified memory. A failed or unverified model unload prevents training from launching.
+
+Caveats: this does not block an agent from running unregistered shell commands, inspect every training command before trusting it. It does not control unrelated GPU processes. Stopping the MTPLX server confirms the service is down, not a precise per-process Metal memory measurement. The newer local controller and actual app-managed MTPLX lifecycle have **not** been tested by this GitHub-only implementation.
+
+## Tests
 
 ```sh
-oc-run status
-oc-run stop --latest          # request a safe handoff; return promptly
-oc-run stop --latest --force  # interrupt the active invocation
-oc-run handoff --latest
-oc-run resume 2h --latest     # inspect interrupted work; give a new budget
+python3 -m unittest discover -s tests -p 'test_gpu.py' -v
 ```
 
-- `--run /path/to/run` selects a recorded run explicitly.
-- Controls select only the current directory's active run, then its newest.
-- `handoff --latest` also allows historical runs from other directories.
-- `--dry-run` shows intent without starting OpenCode or creating state.
-- Non-Git workspaces require `--project-root /path/to/project` on start and resume.
-  Use the same root from nested directories. Controls still select runs by working directory.
-- `--push` permits checked, reviewed pushes. Off by default.
-- Durations: `s`, `m`, `h`. Bare numbers mean minutes.
-- Reported completion stops by default.
-
-Soft stop saves the request and uses OpenCode's native steering inbox.
-`status` shows pending, confirmed, rejected or uncertain admission. Confirmed means
-accepted by OpenCode; delivery waits for a step boundary. Unknown outcomes are
-reconciled before retrying the same message ID. `CONTROL.md` is the fallback.
-There is no automatic escalation. Resume starts a new budget and clears stale steering.
-
-Force stop, Ctrl-C, SIGTERM and terminal closure interrupt work.
-Cleanup sends TERM, then KILL to managed process groups. Other OpenCode services
-are untouched. `status` distinguishes stopping, stopped and interrupted runs.
-
-## Recovery and safety
-
-Private state lives in `~/.local/state/oc-run`, outside your project:
-
-| File | Purpose |
-| --- | --- |
-| `HANDOFF.md` | Short account of work, failures, uncertainty and next steps |
-| `run.json` | Small control snapshot, session ID and recent excerpts |
-| `*-work.jsonl` | Incremental native OpenCode events |
-| `journal.jsonl` | Session identity, requests, warnings and state transitions |
-
-Raw logs remain complete. Parsing skips records above 1 MiB and continues at the
-next newline. Summaries retain the last 65,536 text characters, 32 recent facts per kind
-and updates for 256 recent tool calls. Older call updates may count separately;
-inspect raw logs when a summary is limited. Invocation Markdown files are excerpts.
-Oversized old snapshots remain readable. Resume preserves the original in `legacy-state.json` before compacting it.
-
-Keep logs private: they may contain secrets. `OC_RUN_STATE_DIR` selects another
-private directory outside the Git or declared non-Git workspace, including resolved
-symlink paths. Locks prevent overlapping workers using the same workspace identity
-and state directory. Git uses its common directory. Non-Git roots are explicit;
-separately declared overlapping roots cannot be detected. Unrelated roots remain independent.
-
-After a crash, resume preserves partial logs, reconstructs complete events and
-checks OpenCode's persisted session. The worker must inspect files, jobs and
-uncertain side effects before repeating non-idempotent actions. Legacy handoffs
-remain readable.
-
-Raw logs use `fsync` on useful events and roughly one-second polling boundaries.
-Control records are synced; atomic snapshots also sync their parent directory.
-This requests filesystem durability, not guaranteed power-loss recovery.
-Unsynced tokens and unrecorded effects may be lost. No physical reboot was tested.
-
-## Limits and checks
-
-- Four identical consecutive failures trigger one warning per invocation.
-  Changed inputs or successful tools break the streak. Warnings never kill work.
-- No reasoning-loop, drift or overengineering judgement; no automatic restarts.
-  Provider and process errors stop with evidence preserved.
-- OpenCode 2.0.28 omits child-session events from the parent's CLI stream.
-  Child tool failures and progress may be absent; inspect native sessions before recovery.
-- Stop and Git rules are cooperative, not a sandbox. Detached jobs can escape
-  cleanup. Other OpenCode versions may change APIs or events.
-- Exit `0`: model-reported completion with evidence and successful tools, not
-  independent proof. Run your own acceptance checks. `3`: stopped/incomplete.
-  `1`: invocation/report failure.
-  `2`: setup error. Signals: `128 + signal`.
-
-Run deterministic tests without a model:
-
-```sh
-python3 -m unittest discover -s tests -v
-```
-
-MIT licence. See [LICENSE](LICENSE).
+The tests use a fake OpenCode CLI, an HTTP server and a synthetic training job. No real GPU work is performed.

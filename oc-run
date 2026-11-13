@@ -1,904 +1,279 @@
 #!/usr/bin/env python3
-"""A small, cooperative OpenCode controller. Python standard library, POSIX only."""
+"""Keep one OpenCode session working; hand off exclusive GPU work between turns."""
 import argparse
-import base64
-from collections import deque
-from contextlib import contextmanager
-import fcntl
-import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import re
-import select
-import shutil
 import signal
-import stat
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
 import uuid
 
-CLEANUP_SECONDS = 3
-MAX_EVENT_BYTES = 1024 * 1024
-SUMMARY_ITEMS = 32
-RECENT_CALLS = 256
-TEXT_LIMIT = 64 * 1024
-
-
-def atomic_write(path, text):
-    fd, name = tempfile.mkstemp(prefix=".write-", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(name, path)
-        sync_directory(path.parent)
-    finally:
-        if os.path.exists(name):
-            os.unlink(name)
-
-
-def read(path, limit=1024 * 1024, required=False):
-    """Never follow a state-file symlink or read a device."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        if not required:
-            return ""
-        raise
-    except OSError:
-        if not required and path.is_symlink():
-            return ""
-        raise
-    with os.fdopen(fd, encoding="utf-8", errors="strict" if required else "replace", newline="") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-            raise ValueError(f"not a regular file: {path}")
-        text = handle.read() if limit is None else handle.read(limit + 1)
-        if limit is not None and len(text) > limit:
-            raise ValueError(f"file exceeds read limit: {path}")
-        return text
-
-
-def load_state(run):
-    # Old snapshots can exceed 1 MiB. Read them explicitly, never as missing state.
-    try:
-        state = json.loads(read(run / 'run.json', limit=None, required=True))
-        if (not isinstance(state, dict) or not isinstance(state.get('cwd'), str)
-                or not isinstance(state.get('status'), str)
-                or not all(isinstance(state.get(k), (int, float)) for k in ('elapsed', 'budget', 'invocations'))
-                or not isinstance(state.get('incidents'), list)
-                or not all(isinstance(x, str) for x in state['incidents'])
-                or not isinstance(state.get('git_before'), dict)
-                or not isinstance(state['git_before'].get('changes'), str)
-                or not isinstance(state.get('last_work', ''), str)
-                or (state.get('review') is not None and final_report(json.dumps(state['review'])) is None)
-                or not isinstance(state.get('started', 0), (int, float))):
-            raise ValueError('invalid controller state fields')
-        if (state.get('session') is not None and not isinstance(state['session'], str)
-                or state.get('pid') is not None and (type(state['pid']) is not int or state['pid'] <= 0)
-                or not isinstance(state.get('stop_delivery', {}), dict)
-                or not isinstance(state.get('git_after', state['git_before']), dict)
-                or not isinstance(state.get('git_after', state['git_before']).get('changes'), str)):
-            raise ValueError('invalid session, process or control fields')
-        return state
-    except (ValueError, OSError) as exc:
-        raise ValueError(f"cannot read state {run / 'run.json'}: {exc}") from exc
+CONTINUE = (
+    "Review the original task and work so far. Choose and execute the next useful "
+    "step. Preserve evidence and avoid repeating failed actions without new evidence."
+)
+HANDOFF = (
+    "For a long GPU training job, first save its reproducible inputs and outputs. "
+    "If an exclusive MTPLX GPU handoff is configured, register it using "
+    "`oc-run train -- <program> <arguments>` from a shell tool, without nohup, "
+    "disown, '&', or a separate background process. Then end this OpenCode turn "
+    "so the controller can unload the model, run training, restore the model and "
+    "continue this same session. Never expose credentials in tool output. "
+    "If handoff is unavailable, do not launch a competing long GPU job; report "
+    "the proposed command instead."
+)
 
 
 def duration(text):
-    match = re.fullmatch(r"(\d+(?:\.\d+)?)([smh]?)", text.lower())
-    value = float(match[1]) * {"s": 1, "m": 60, "h": 3600}[match[2] or "m"] if match else 0
-    if not math.isfinite(value) or value <= 0:
-        raise argparse.ArgumentTypeError("use a positive duration such as 30m or 10h")
-    return value
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(s|m|h)", text)
+    if not m or float(m[1]) <= 0:
+        raise argparse.ArgumentTypeError("duration must be positive: 15m, 2h or 10h")
+    return float(m[1]) * {"s": 1, "m": 60, "h": 3600}[m[2]]
 
 
-def git(*args):
+def private_directory(path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=False)
+    path.chmod(0o700)
+    return path
+
+
+def save_json(path, payload):
+    temp = path.with_name(path.name + ".tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        result = subprocess.run(["git", *args], capture_output=True, text=True, timeout=10)
-        return result.stdout.strip() if result.returncode == 0 else None
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
-def snapshot():
-    changes = git("status", "--short", "--untracked-files=normal")
-    return {"head": git("rev-parse", "HEAD"), "branch": git("branch", "--show-current"),
-            "changes": changes if changes is not None else "Git status unavailable (non-Git project or command failed)."}
-
-
-def send_group(pid, sig):
-    try:
-        os.killpg(pid, sig)
-    except ProcessLookupError:
-        pass
-
-
-def cleanup(proc, grace=CLEANUP_SECONDS):
-    """Cleanup is bounded; productive invocations have no timer."""
-    send_group(proc.pid, signal.SIGTERM)
-    try:
-        proc.wait(timeout=grace)
-    except subprocess.TimeoutExpired:
-        pass
-    send_group(proc.pid, signal.SIGKILL)  # includes children after their leader exits
-    try:
-        proc.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        pass
-
-
-def child_guard(fd, command):
-    """A pipe closes even on runner SIGKILL. Only guardians retain lock leases; worker processes inherit none."""
-    stopping = False
-    def stop(*_):
-        nonlocal stopping
-        stopping = True
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
-    # Own a separate worker group so cleanup can kill descendants and still return
-    # the immediate child's exit code. The guardian retains the lock leases.
-    proc = subprocess.Popen(command, close_fds=True, start_new_session=True)
-    try:
-        while proc.poll() is None and not stopping:
-            ready, _, _ = select.select([fd], [], [], .1)
-            if ready and not os.read(fd, 1):
-                break
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
     finally:
-        cleanup(proc)
-    return proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
+        if temp.exists():
+            temp.unlink()
 
 
-def sync_directory(path):
-    fd = os.open(path, os.O_RDONLY)
+def register_training(argv):
+    path = os.environ.get("OC_RUN_HANDOFF_FILE")
+    root = os.environ.get("OC_RUN_WORKSPACE")
+    if not path or not root:
+        raise SystemExit("No active OC Run GPU handoff. Training not started.")
+    if not argv:
+        raise SystemExit("Specify training argv after -- (no shell operators).")
+    if any(a in {"&", "nohup", "disown", "|", ";"} for a in argv):
+        raise SystemExit("Background and shell operators are not permitted.")
+    destination = Path(path)
+    if destination.exists():
+        raise SystemExit("A GPU handoff request already exists; training not started.")
+    data = {"argv": argv, "cwd": root}
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+        f.write("\n")
+    print("GPU training registered. End this OpenCode turn; OC Run will run it after model unload.")
+
+
+def read_lifecycle(path):
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    if obj.get("exclusive") is not True:
+        raise ValueError("lifecycle config must explicitly assert exclusive MTPLX use")
+    for name in ("stop", "start"):
+        value = obj.get(name)
+        if not isinstance(value, list) or not value or not all(isinstance(v, str) and v for v in value):
+            raise ValueError(f"{name} must be a non-empty JSON argv array")
+    if not isinstance(obj.get("model_id"), str) or not obj["model_id"]:
+        raise ValueError("model_id must name the existing MTPLX served model")
+    url = obj.get("health", "http://127.0.0.1:8000/health")
+    if not re.fullmatch(r"http://(?:127\.0\.0\.1|localhost):\d+/health", url):
+        raise ValueError("health must point to a loopback MTPLX /health endpoint")
+    return obj
+
+
+def health(url):
     try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def journal(run, kind, **data):
-    # One append per record; concurrent stop commands never rewrite worker state.
-    fd = os.open(run / "journal.jsonl", os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        size = os.fstat(fd).st_size
-        prefix = b"\n" if size and os.pread(fd, 1, size - 1) != b"\n" else b""
-        record = prefix + (json.dumps({"time": time.time(), "kind": kind, **data}) + "\n").encode()
-        if os.write(fd, record) != len(record):
-            raise OSError("short journal write")
-        os.fsync(fd)
-        if not size:
-            sync_directory(run)
-    finally:
-        os.close(fd)
-
-
-@contextmanager
-def guarded(command, output, message=None, env=None, leases=()):
-    reader, writer = os.pipe()
-    proc = None
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "_child", str(reader), *command],
-            stdin=message if message is not None else subprocess.DEVNULL,
-            stdout=output, stderr=subprocess.STDOUT, pass_fds=(reader, *leases), start_new_session=True,
-            env=env or {**os.environ, "PWD": str(Path.cwd())})
-        os.close(reader)
-        reader = None
-        yield proc
-    finally:
-        if proc is not None:
-            cleanup(proc, grace=CLEANUP_SECONDS + 2)  # let the guardian finish bounded worker cleanup
-        os.close(writer)
-        if reader is not None:
-            os.close(reader)
-
-
-class NativeServer:
-    """The run's private OpenCode server; never attach to an unrelated service."""
-    def request(self, path, body=None, method=None):
-        req = urllib.request.Request(self.url + "/api/" + path,
-              data=json.dumps(body).encode() if body is not None else None, method=method,
-              headers={"Authorization": "Basic " + base64.b64encode(
-                  ("opencode:" + self.password).encode()).decode(), "Content-Type": "application/json"})
-        # Bound control transport only, never model work. Do not retry unknown POST outcomes.
-        with urllib.request.urlopen(req, timeout=2) as response:
-            return json.loads(response.read() or b"null")
-
-    def connect(self, log, proc, tick):
-        until = time.monotonic() + 20
-        fd = os.open(log, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, 'rb') as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                raise ValueError(f'not a regular file: {log}')
-            reader = RecordReader(handle)
-            url = password = None
-            while proc.poll() is None and time.monotonic() < until:
-                for line in reader.records():
-                    if line is None:
-                        continue
-                    text = line.decode('utf-8', errors='replace')
-                    url = re.search(r"server listening on (http://127\.0\.0\.1:\d+)", text) or url
-                    password = re.search(r"server password (\S+)", text) or password
-                    if url and password:
-                        self.url, self.password = url[1], password[1]
-                        return
-                tick()
-                time.sleep(.1)
-        raise ValueError("private OpenCode server did not start; inspect server log")
-
-
-def steer(server, run, state, text, delivery):
-    """Reconcile an uncertain admission before retrying the same native inbox ID."""
-    def record(status, error=None):
-        delivery.update(status=status)
-        journal(run, 'steering_' + status, message=delivery['id'], error=error)
-        save(run, state)
-
-    path = f"session/{state['session']}"
-    if delivery['status'] in ('confirmed', 'rejected'):
-        return
-    if delivery['status'] == 'uncertain':
-        try:
-            pending = server.request(path + '/inbox')['data']
-            if not isinstance(pending, list) or not all(isinstance(x, dict) for x in pending):
-                raise ValueError('invalid inbox response')
-            if any(x.get('id') == delivery['id'] for x in pending):
-                record('confirmed')
-                return
-            try:
-                message = server.request(path + '/message/' + delivery['id'])['data']
-            except urllib.error.HTTPError as exc:
-                if exc.code != 404:
-                    raise
-            else:
-                if not isinstance(message, dict) or message.get('id') != delivery['id']:
-                    raise ValueError('invalid message response')
-                record('confirmed')
-                return
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            record('uncertain', str(exc))
-            return  # No absence proof: keep CONTROL.md and do not duplicate a POST.
-    # Persist intent before sending. A runner crash cannot erase an unknown outcome.
-    record('uncertain')
-    try:
-        receipt = server.request(path + '/prompt', {"id": delivery['id'], "text": text,
-                                 "delivery": "steer", "resume": False})
-        if not isinstance(receipt, dict) or not isinstance(receipt.get('data'), dict) \
-                or receipt['data'].get('id') != delivery['id']:
-            raise ValueError('steering acknowledgement missing the requested ID')
-    except urllib.error.HTTPError as exc:
-        record('rejected' if exc.code in (400, 401, 403, 404, 409, 422) else 'uncertain', str(exc))
-    except (OSError, ValueError) as exc:
-        record('uncertain', str(exc))
-    else:
-        record('confirmed')
-
-
-class RecordReader:
-    """Read complete bounded records, including across temporary tail EOFs."""
-    def __init__(self, handle):
-        self.handle = handle
-        self.pending = bytearray()
-        self.oversized = False
-
-    def records(self):
-        while chunk := self.handle.readline(64 * 1024):
-            if not self.oversized:
-                self.pending.extend(chunk)
-                if len(self.pending) > MAX_EVENT_BYTES:
-                    self.pending.clear()
-                    self.oversized = True
-            if chunk.endswith(b'\n'):
-                line = None if self.oversized else bytes(self.pending)
-                self.pending.clear()
-                self.oversized = False
-                yield line
-
-    def events(self):
-        for line in self.records():
-            if line is None:
-                yield None  # Diagnose skipped oversized records; raw evidence stays on disk.
-                continue
-            try:
-                yield json.loads(line)
-            except (ValueError, RecursionError):
-                continue  # CLI diagnostics and malformed JSON stay in the raw log.
-
-
-def invoke(binary, prompt, run, name, session, on_tick, on_event=lambda _: None, server=None, leases=(), summary=None):
-    command = [binary, "run", "--format", "json"]
-    command += ["--server", server.url] if server else ["--standalone"]
-    if session:
-        command += ["--session", session]
-    env = {**os.environ, "PWD": str(Path.cwd())}
-    if server:
-        env['OPENCODE_PASSWORD'] = server.password
-    path = run / (name + ".jsonl")
-    # Raw CLI events are already a native stream. Tail it while the worker runs.
-    with path.open("xb", buffering=0) as log, path.open("rb") as tail, tempfile.TemporaryFile() as message:
-        message.write(prompt.encode())
-        message.seek(0)
-        reader, last_sync = RecordReader(tail), time.monotonic()
-
-        def drain():
-            nonlocal last_sync
-            for event in reader.events():
-                if summary is not None:
-                    summary.consume(event)
-                if isinstance(event, dict) and event.get('type') in ('step_start', 'tool_use', 'text', 'error', 'step_finish'):
-                    os.fsync(log.fileno())
-                    on_event(event)
-            if time.monotonic() - last_sync >= 1:
-                os.fsync(log.fileno())
-                last_sync = time.monotonic()
-
-        try:
-            with guarded(command, log, message, env, leases) as proc:
-                while proc.poll() is None:
-                    drain()
-                    on_tick()
-                    time.sleep(.1)
-                drain()
-                return proc.returncode
-        finally:
-            drain()
-            os.fsync(log.fileno())
-
-
-def event_fields(event):
-    """Validate the small part of the native event shape we actually consume."""
-    if not isinstance(event, dict) or not isinstance(event.get('type'), str):
-        raise ValueError('event/type must be an object/string')
-    if event.get('sessionID') is not None and (not isinstance(event['sessionID'], str)
-                                             or len(event['sessionID']) > 200):
-        raise ValueError('invalid session ID')
-    values = []
-    parent = event
-    for key in ('part', 'state', 'metadata', 'metadata'):
-        value = parent.get(key)
-        if value is None:
-            value = {}
-        if not isinstance(value, dict):
-            raise ValueError(f'{key} must be an object or null')
-        values.append(value)
-        parent = value
-    part = values[0]
-    for key in ('id', 'callID', 'tool', 'text'):
-        if key in part and not isinstance(part[key], str):
-            raise ValueError(f'part.{key} must be a string')
-    return values
-
-
-class EventSummary:
-    """Recent facts only; complete output remains in the raw invocation log."""
-    def __init__(self):
-        self.result = {"session": None, "text": "", "successful_tools": 0}
-        self.result.update({key: deque(maxlen=SUMMARY_ITEMS)
-                            for key in ('failures', 'successes', 'errors', 'diagnostics')})
-        self.calls = {}
-        self.limited = False
-
-    def settle(self, record, bad):
-        if bad or record['status'] != 'completed':
-            self.result['failures'].append(record)
-        else:
-            self.result['successful_tools'] += 1
-            self.result['successes'].append(record)
-
-    def consume(self, event):
-        result = self.result
-        if event is None:
-            result['diagnostics'].append('oversized event skipped; inspect raw log')
-            return
-        if isinstance(event, dict) and event.get('type') == 'error':
-            result['errors'].append(str(event.get('error', event))[:1000])
-        try:
-            part, state, meta, detail = event_fields(event)
-        except ValueError as exc:
-            result['diagnostics'].append(f'malformed event: {exc}; inspect raw log')
-            return
-        result['session'] = event.get('sessionID') or result['session']
-        if event.get('type') == 'text':
-            text = result['text'] + ('\n' if result['text'] else '') + part.get('text', '')
-            self.limited |= len(text) > TEXT_LIMIT
-            result['text'] = text[-TEXT_LIMIT:]
-        if event.get('type') == 'tool_use':
-            code = meta.get('exit', detail.get('exit'))
-            bad = (state.get('status') == 'error' or code not in (None, 0)
-                   or meta.get('error') is True or detail.get('error') is True)
-            call_id = part.get('callID') or part.get('id')
-            record = {'id': excerpt(call_id, 200) if call_id else None,
-                      'tool': excerpt(part.get('tool', ''), 200),
-                      'input': excerpt(json.dumps(state.get('input')), 1000),
-                      'status': str(state.get('status'))[:100],
-                      'detail': str(state.get('error') or state.get('output', ''))[:1000]}
-            # Latest update wins within a bounded recent-call window.
-            key = hashlib.sha256(call_id.encode()).digest() if call_id else object()
-            self.calls.pop(key, None)
-            self.calls[key] = (record, bad)
-            if len(self.calls) > RECENT_CALLS:
-                self.settle(*self.calls.pop(next(iter(self.calls))))
-                self.limited = True
-
-    def finish(self):
-        for record, bad in self.calls.values():
-            self.settle(record, bad)
-        self.calls.clear()
-        if self.limited or any(len(self.result[k]) == SUMMARY_ITEMS
-                               for k in ('failures', 'successes', 'errors', 'diagnostics')):
-            self.result['diagnostics'].append('summary limited; inspect complete raw log')
-        return {key: list(value) if isinstance(value, deque) else value
-                for key, value in self.result.items()}
-
-
-def events(path):
-    summary = EventSummary()
-    with path.open('rb') as handle:
-        for event in RecordReader(handle).events():
-            summary.consume(event)
-    return summary.finish()
-
-
-def final_report(text):
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
-    try:
-        report = json.loads(text)
-    except ValueError:
-        return None
-    if (not isinstance(report, dict) or report.get("decision") != "STOP"
-            or type(report.get("complete")) is not bool
-            or not all(isinstance(report.get(k), str) and report[k].strip()
-                       for k in ("reason", "summary", "next"))
-            or not isinstance(report.get("evidence"), list)
-            or not all(isinstance(x, str) for x in report["evidence"])):
-        return None
-    return {k: report[k] for k in ('decision', 'complete', 'reason', 'summary', 'next', 'evidence')}
-
-
-def excerpt(text, limit=2000):
-    return text if len(text) <= limit else text[:limit] + "\n[Excerpt; full text remains in the run directory.]"
-
-
-def handoff(run, state):
-    report = state.get("review") or {}
-    parts = ["# OC Run handoff", f"Status: {state['status']}. {state.get('reason', '')}",
-             f"Directory: {state['cwd']}\nElapsed: {state['elapsed']:.1f}s (target {state['budget']:.1f}s).",
-             "## Original task (full text in task.txt)\n\n" + excerpt(read(run / "task.txt"), 800),
-             "## Last useful state (model report; verify claims)\n\n" +
-             excerpt(state.get("last_work") or "No work reply recorded.") +
-             "\n\nLast report:\n" + excerpt(report.get("summary", "No final model report recorded.")),
-             "## Evidence cited by the model\n\n" +
-             excerpt("\n".join("- " + x for x in report.get("evidence", [])) or "None recorded."),
-             f"Observed successful tools: {state.get('successful_tools', 0)}. Independent acceptance checks: not run.",
-             "## Failed or interrupted operations\n\n" +
-             excerpt("\n".join("- " + x for x in state.get("incidents", [])) or "None recorded."),
-             "## File changes\n\nBefore:\n" + excerpt(state['git_before']['changes'], 1000) +
-             "\n\nLast observed:\n" + excerpt(state.get('git_after', state['git_before'])['changes'], 1000),
-             "## Unverified\n\nCompletion is a model report, not independent proof. "
-             "Successful tool exits do not prove the results. See raw logs for full details. "
-             "Failures remain historical unless the review explains recovery. "
-             "After interruption, inspect partial output and running jobs before repeating work.",
-             "## Next action\n\n" + excerpt(report.get("next", "Inspect logs and project state, then resume if useful.")),
-             f"Local logs: {run}\nSession: {state.get('session') or 'not recorded'}"]
-    return "\n\n".join(parts) + "\n"
-
-
-def save(run, state):
-    if not state.get('compact_state') and (run / 'run.json').exists():
-        # Preserve pre-upgrade evidence once, before replacing an old snapshot.
-        if not (run / 'legacy-state.json').exists():
-            atomic_write(run / 'legacy-state.json', read(run / 'run.json', limit=None, required=True))
-    state['compact_state'] = True
-    preview = {k: state[k] for k in ('cwd', 'session', 'elapsed', 'budget', 'invocations', 'started',
-               'successful_tools', 'status', 'pid', 'identity', 'push', 'execution', 'compact_state',
-               'stop_delivery') if k in state}
-    preview['last_work'] = excerpt(state.get('last_work', ''))
-    preview['incidents'] = [excerpt(x, 1000) for x in state['incidents'][-12:]]
-    preview['reason'] = excerpt(state.get('reason', ''), 1000)
-    for key in ('git_before', 'git_after'):
-        if key in state:
-            preview[key] = {k: excerpt(v, 1000) if isinstance(v, str) else v for k, v in state[key].items()}
-    if state.get('review'):
-        preview['review'] = {k: excerpt(v) if isinstance(v, str) else v for k, v in state['review'].items()}
-        preview['review']['evidence'] = [excerpt(x, 1000) for x in state['review']['evidence'][:12]]
-    atomic_write(run / "run.json", json.dumps(preview, indent=2) + "\n")
-    atomic_write(run / "HANDOFF.md", handoff(run, state))
-
-
-def incident(run, state, text):
-    journal(run, 'incident', detail=text)
-    state['incidents'] = (state['incidents'] + [text])[-12:]
-
-
-def active(run):
-    if not (run / 'owner.lock').exists():
+        with urllib.request.urlopen(url, timeout=2) as response:
+            return response.status == 200
+    except (OSError, urllib.error.URLError):
         return False
-    fd = os.open(run / 'owner.lock', os.O_RDONLY | os.O_NOFOLLOW)
+
+
+def matches_model(url, model_id):
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return False
-        except BlockingIOError:
+        models_url = url.removesuffix("/health") + "/v1/models"
+        with urllib.request.urlopen(models_url, timeout=3) as response:
+            data = json.load(response)
+        return any(item.get("id") == model_id for item in data.get("data", []))
+    except (OSError, ValueError, urllib.error.URLError):
+        return False
+
+
+def await_health(url, desired, seconds=60):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if health(url) is desired:
             return True
-    finally:
-        os.close(fd)
+        time.sleep(0.4)
+    return health(url) is desired
 
 
-def latest(root, historical=False):
-    if not root.exists():
-        raise ValueError('no recorded run')
-    choices = [p for p in root.iterdir() if p.is_dir() and not p.is_symlink()
-               and ((p / "run.json").is_file() or (p / "STATE.md").is_file())]
-    states = {}
-    for path in choices:
-        if (path / 'run.json').exists() or (path / 'run.json').is_symlink():
+def run_command(argv, cwd, output_path, env=None, foreground=True):
+    with output_path.open("wb") as output:
+        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                stdout=output, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+        if not foreground:
+            return proc
+        try:
+            return proc.wait()
+        except KeyboardInterrupt:
+            # Do not silently orphan or forcibly kill potentially checkpointing work.
+            os.killpg(proc.pid, signal.SIGINT)
             try:
-                states[path] = load_state(path)
-            except ValueError as exc:
-                print(f'oc-run: {exc}; use --run PATH to inspect explicitly', file=sys.stderr)
-    local = [p for p, state in states.items() if Path(state['cwd']).resolve() == Path.cwd()]
-    choices = [p for p in choices if p in states or not (p / 'run.json').exists()]
-    choices = local or (choices if historical else [])
-    if not choices:
-        raise ValueError("no recorded run for the current project; use --run PATH for explicit selection")
-    return max(choices, key=lambda p: (active(p), states.get(p, {}).get('started', 0), p.name))
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                print(f"Training PID {proc.pid} still running after interrupt. "
+                      f"Inspect {output_path}; model remains unloaded.", file=sys.stderr)
+                raise RuntimeError("training still active; manual recovery required")
+            raise
 
 
-def identity(pid):
-    result = subprocess.run(['ps', '-p', str(pid), '-o', 'lstart=', '-o', 'command='],
-                            capture_output=True, text=True, timeout=2)
-    return result.stdout.strip() if result.returncode == 0 else None
+def gpu_handoff(request_file, lifecycle, logdir, root):
+    data = json.loads(request_file.read_text(encoding="utf-8"))
+    if data.get("cwd") != str(root) or not isinstance(data.get("argv"), list) or not data["argv"]:
+        raise ValueError("invalid or mismatched training request")
+    cmd = data["argv"]
+    if not all(isinstance(x, str) and x for x in cmd):
+        raise ValueError("training command must contain only non-empty strings")
+    url = lifecycle.get("health", "http://127.0.0.1:8000/health")
+    if not health(url) or not matches_model(url, lifecycle["model_id"]):
+        raise RuntimeError("expected MTPLX model not serving: refusing unload and training")
+    print("GPU handoff: stopping exclusive MTPLX model server", flush=True)
+    stop_rc = run_command(lifecycle["stop"], root, logdir / "mtplx-stop.log")
+    if stop_rc != 0 or not await_health(url, False):
+        raise RuntimeError("MTPLX unload unverified. Training was NOT started; inspect logs")
+    # A stopped server process releases its own Metal allocations. Do not infer
+    # availability of memory held by other unrelated applications.
+    request_file.rename(logdir / "training-request.accepted.json")
+    train_rc = None
+    interrupted = False
+    safe_to_restore = True
+    try:
+        print("GPU handoff: running registered training; model server offline", flush=True)
+        train_rc = run_command(cmd, root, logdir / "training.log")
+    except KeyboardInterrupt:
+        interrupted = True
+    except RuntimeError:
+        safe_to_restore = False  # Training is still active: no competing Sage reload.
+        raise
+    finally:
+        if safe_to_restore:
+            print("GPU handoff: restoring MTPLX", flush=True)
+            server = run_command(lifecycle["start"], root, logdir / "mtplx-start.log", foreground=False)
+            if not await_health(url, True, seconds=120) or not matches_model(url, lifecycle["model_id"]):
+                raise RuntimeError(f"MTPLX restoration/model identity unverified (PID {server.pid}); manual recovery required")
+    save_json(logdir / "training-result.json", {"exit_code": train_rc, "interrupted": interrupted})
+    if interrupted:
+        raise KeyboardInterrupt
+    return train_rc
 
 
-def control(run, command, force=False):
-    state = load_state(run)
-    running = active(run)
-    status = state['status']
-    if running and identity(state.get('pid', -1)) != state.get('identity'):
-        print(f'oc-run: interrupted; process-group cleanup in progress\nRun: {run}')
-        return 3
-    if not running and status in ('running', 'stopping'):
-        status = 'interrupted (no live owner; inspect before resuming)'
-    if command == 'stop' and running:
-        request = {"reason": "user stop requested", "force": force, "time": time.time(),
-                   "execution": state.get('execution')}
-        atomic_write(run / ('force.json' if force else 'stop.json'), json.dumps(request) + "\n")
-        journal(run, 'stop_requested', **request)
-        status = 'stopping'
-        if force:
-            pid = state.get('pid')
-            if not pid or not state.get('identity') or identity(pid) != state['identity']:
-                raise ValueError("force request saved; runner identity unavailable, no process signalled")
-            os.kill(pid, signal.SIGTERM)
-            until = time.monotonic() + CLEANUP_SECONDS + 2
-            while active(run) and time.monotonic() < until:
-                time.sleep(.1)
-            if active(run) and identity(pid) == state['identity']:
-                os.kill(pid, signal.SIGKILL)  # pipe guardians clean only their own process groups
-            status = 'force requested; in-flight actions uncertain'
-    elif running and json.loads(read(run / 'stop.json') or '{}').get('execution') == state.get('execution'):
-        status = 'stopping'
-    if status == 'stopping':
-        delivery = state.get('stop_delivery', {}).get('status', 'pending')
-        status += f'; steering {delivery} (confirmed means native acceptance, not worker completion)'
-    print(f"oc-run: {status}\nRun: {run}\nSession: {state.get('session') or 'not recorded'}")
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "train":
+        args = sys.argv[2:]
+        if args and args[0] == "--":
+            args = args[1:]
+        register_training(args)
+        return 0
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("budget", type=duration)
+    parser.add_argument("prompt", nargs="+")
+    parser.add_argument("--gpu-lifecycle", type=Path, help="opt-in exclusive MTPLX stop/start argv JSON")
+    args = parser.parse_args()
+    root = Path.cwd().resolve()
+    base = Path(os.environ.get("OC_RUN_STATE_DIR", "~/.local/state/oc-run")).expanduser()
+    base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    logdir = private_directory(base / ("timer-" + time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]))
+    session = "ses_" + uuid.uuid4().hex
+    lifecycle = read_lifecycle(args.gpu_lifecycle) if args.gpu_lifecycle else None
+    deadline = time.monotonic() + args.budget
+    print(f"Logs: {logdir}\nSession: {session}\nBudget: {args.budget:g}s", flush=True)
+    prompt = " ".join(args.prompt)
+    if lifecycle:
+        prompt += "\n\n" + HANDOFF
+    turn = 0
+    fast_no_tool = 0
+    while True:
+        turn += 1
+        request_file = logdir / "training-request.json"
+        env = os.environ.copy()
+        if lifecycle:
+            env["OC_RUN_HANDOFF_FILE"] = str(request_file)
+            env["OC_RUN_WORKSPACE"] = str(root)
+        else:
+            env.pop("OC_RUN_HANDOFF_FILE", None)
+            env.pop("OC_RUN_WORKSPACE", None)
+        binary = os.environ.get("OC_NATIVE_BIN", "opencode")
+        command = [binary, "run", "--standalone", "--format", "json", "--session", session]
+        agent = os.environ.get("OC_NATIVE_AGENT")
+        if agent:
+            command += ["--agent", agent]
+        elapsed_start = time.monotonic()
+        print(f"Starting OpenCode turn {turn}", flush=True)
+        try:
+            with (logdir / f"{turn:04d}.stdout.jsonl").open("wb") as out, (logdir / f"{turn:04d}.stderr.log").open("wb") as err:
+                rc = subprocess.run(command, input=prompt.encode(), cwd=root, env=env,
+                                    stdout=out, stderr=err, check=False).returncode
+        except KeyboardInterrupt:
+            print(f"Interrupted. Session {session}; logs {logdir}", file=sys.stderr)
+            return 130
+        except OSError as ex:
+            print(f"Could not start OpenCode: {ex}; logs {logdir}", file=sys.stderr)
+            return 1
+        elapsed = time.monotonic() - elapsed_start
+        print(f"Turn {turn}: exit {rc}, {elapsed:.1f}s", flush=True)
+        if rc != 0:
+            print("Native execution failed; no training launched. Inspect raw logs.", file=sys.stderr)
+            return 1
+        summary = ""
+        if request_file.exists():
+            if not lifecycle:
+                print("Unexpected training request without lifecycle; refusing", file=sys.stderr)
+                return 1
+            try:
+                train_rc = gpu_handoff(request_file, lifecycle, logdir, root)
+            except (OSError, ValueError, RuntimeError) as exc:
+                print(f"GPU handoff failed: {exc}; logs {logdir}", file=sys.stderr)
+                return 1
+            except KeyboardInterrupt:
+                print(f"Interrupted; logs {logdir}", file=sys.stderr)
+                return 130
+            summary = f"The GPU training subprocess exited {train_rc}. Inspect training.log and outputs. "
+            if train_rc != 0:
+                print(f"Training failed with exit {train_rc}; Sage can diagnose, not silently repeat.")
+            fast_no_tool = 0
+        else:
+            # Only a very short tool-free round contributes to the loop guard.
+            uses_tool = False
+            try:
+                with (logdir / f"{turn:04d}.stdout.jsonl").open(encoding="utf-8") as f:
+                    uses_tool = any('"type":"tool_use"' in line or '"type": "tool_use"' in line for line in f)
+            except OSError:
+                pass
+            fast_no_tool = fast_no_tool + 1 if elapsed < 2 and not uses_tool else 0
+            if fast_no_tool >= 3:
+                print("Stopped: three immediate tool-free turns; inspect session.")
+                break
+        if time.monotonic() >= deadline:
+            print("Budget elapsed; no new OpenCode turn.", flush=True)
+            break
+        prompt = summary + CONTINUE
+    print(f"Session: {session}; logs: {logdir}", flush=True)
     return 0
 
 
-SAFETY = """The original task controls scope and permission, including read-only limits.
-Preserve existing uncommitted work. Never force push, merge, reset destructively,
-delete unique data, weaken tests, change provider configuration or upload private material.
-Do not push unless explicitly permitted below. Review staged files and history for
-secrets and private content before any permitted push. Do not commit unrelated work.
-Controller instructions are guidance, not a security sandbox.
-"""
-
-
-RESULT = """At the end, give a concise handoff: completed work, actual evidence, failures and
-how they recovered, pending work and uncertainty. On a separate final line write:
-OC_RUN_RESULT {"decision":"STOP","complete":false,"reason":"why","summary":"handoff",
-"evidence":["actual result and source"],"next":"next action or none"}
-Set complete=true only if every requested requirement is supported by evidence.
-"""
-STOP = "STOP: finish the active action safely, preserve results and give the final handoff. Start no substantial new work.\n" + RESULT
-
-
-def recover(run, state):
-    """Rebuild from complete raw records; a torn final line stays in its original log."""
-    state['successful_tools'] = 0
-    for path in sorted(run.glob('[0-9]*-*.jsonl'), key=lambda p: int(p.name.split('-')[0])):
-        state['invocations'] = max(state['invocations'], int(path.name.split('-')[0]))
-        facts = events(path)
-        state['successful_tools'] += facts['successful_tools']
-        state['session'] = facts['session'] or state.get('session')
-        if facts['text'] and '-work' in path.name:
-            state['last_work'] = facts['text']
-        for item in facts['failures'] + facts['errors'] + facts['diagnostics']:
-            text = f"{path.name}: {json.dumps(item, ensure_ascii=False)}"
-            if text not in state['incidents']:
-                incident(run, state, text)
-    if state['status'] in ('running', 'stopping', 'interrupted', 'forced'):
-        incident(run, state, "Prior invocation was in-flight: external side effects may have occurred "
-                            "without a recorded result. Do not automatically repeat non-idempotent actions.")
-    state['review'] = None
-
-
-def execute(args, binary, root, run=None, repo_lock=None):
-    before = snapshot()
-    if run:
-        state = load_state(run)
-        if Path(state["cwd"]).resolve() != Path.cwd():
-            raise ValueError("resume from the recorded project directory")
-        if active(run):
-            raise ValueError("run still has a live owner")
-        recover(run, state)
-        incident(run, state, "Resumed: inspect prior in-flight actions before repeating them.")
-    else:
-        run = Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%dT%H%M%S-"), dir=root))
-        sync_directory(root)
-        atomic_write(run / "task.txt", " ".join(args.task) + "\n")
-        state = {"cwd": str(Path.cwd()), "session": None, "elapsed": 0, "invocations": 0,
-                 "incidents": [], "git_before": before, "started": time.time(), "review": None,
-                 "successful_tools": 0}
-    owner = (run / 'owner.lock').open('a')
-    fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    leases = (owner.fileno(), repo_lock) if repo_lock is not None else (owner.fileno(),)
-    start, prior = time.monotonic(), state["elapsed"]
-    state.pop('stop_delivery', None)
-    state.update(status="running", reason="", budget=prior + args.duration,
-                 pid=os.getpid(), identity=identity(os.getpid()), push=args.push, execution=uuid.uuid4().hex)
-    save(run, state)
-    journal(run, 'running', execution=state['execution'], session=state['session'])
-    print(f"oc-run: state {run}\noc-run: pid {os.getpid()} (status / stop --latest)", flush=True)
-    stopped, last_saved, next_delivery = False, start, start
-    code, handlers, server = 1, {}, NativeServer()
-    repeat, repeat_count, last_call, warned = None, 0, None, False
-    control_prefix = 'msg_ocrun_' + hashlib.sha256(os.fsencode(run)).hexdigest()[:12] + '_'
-
-    def interrupt(signum, _frame):
-        for sig in handlers:
-            signal.signal(sig, signal.SIG_IGN)
-        raise KeyboardInterrupt(signum)
-
-    def tick():
-        nonlocal stopped, last_saved, next_delivery
-        now = time.monotonic()
-        state['elapsed'] = prior + now - start
-        request = json.loads(read(run / 'stop.json') or '{}')
-        requested = request.get('execution') == state['execution']
-        if not stopped and (requested or now - start >= args.duration):
-            stopped = True
-            state.update(status='stopping', reason='user stop requested' if requested else 'budget ended')
-            state['stop_delivery'] = {'id': control_prefix + state['execution'], 'status': 'pending'}
-            atomic_write(run / "CONTROL.md", STOP)
-            journal(run, 'stopping', reason=state['reason'])
-            save(run, state)
-            print(f"oc-run: {state['reason']}; waiting for a safe handoff", flush=True)
-        if stopped and state['session'] and hasattr(server, 'url') and now >= next_delivery:
-            next_delivery = now + 2
-            steer(server, run, state, STOP, state['stop_delivery'])
-        if now - last_saved >= 30:
-            save(run, state)
-            last_saved = now
-
-    def observe(event):
-        nonlocal repeat, repeat_count, last_call, warned
-        try:
-            part, item, meta, nested = event_fields(event)
-        except ValueError as exc:
-            journal(run, 'malformed_event', error=str(exc))
-            return
-        session = event.get('sessionID')
-        if session and session != state['session']:
-            state['session'] = session
-            journal(run, 'session', session=session)
-            save(run, state)
-        if event.get('type') != 'tool_use':
-            return
-        bad = (item.get('status') == 'error' or meta.get('exit', nested.get('exit')) not in (None, 0)
-               or meta.get('error') is True or nested.get('error') is True)
-        call = part.get('callID') or part.get('id')
-        if item.get('status') not in ('error', 'completed') or (call and call == last_call):
-            return
-        last_call = call
-        signature = json.dumps([part.get('tool'), item.get('input'), item.get('error') or item.get('output')], sort_keys=True)
-        repeat_count = repeat_count + 1 if bad and signature == repeat else int(bad)
-        repeat = signature if bad else None
-        if repeat_count >= 4 and not warned:
-            warned = True
-            warning = "WARN: four consecutive identical unsuccessful actions with unchanged recorded inputs/results. " + \
-                      "Inspect what changed before retrying; choose a smaller different approach if no new evidence."
-            journal(run, 'warning', reason=warning, call=call)
-            incident(run, state, warning)
-            atomic_write(run / 'CONTROL.md', STOP if stopped else warning + "\n")
-            if not stopped:
-                steer(server, run, state, warning, {'id': control_prefix + uuid.uuid4().hex, 'status': 'pending'})
-
-    def call(phase, prompt):
-        state['invocations'] += 1
-        name = f"{state['invocations']:04d}-{phase}"
-        journal(run, 'invocation_started', name=name, session=state['session'])
-        save(run, state)
-        summary = EventSummary()
-        try:
-            rc = invoke(binary, prompt, run, name, state['session'], tick, observe, server, leases, summary)
-        finally:
-            facts = summary.finish()
-            state['successful_tools'] += facts['successful_tools']
-            state['session'] = facts['session'] or state['session']
-            state['last_work'] = facts['text'] or state.get('last_work', '')
-            atomic_write(run / (name + '.md'), facts['text'])
-            for item in facts['failures'] + facts['errors'] + facts['diagnostics']:
-                incident(run, state, f"{name}.jsonl: {json.dumps(item, ensure_ascii=False)}")
-        journal(run, 'invocation_ended', name=name, exit=rc)
-        if rc != 0 or facts['errors']:
-            incident(run, state, f"{name}: process exit={rc}; work may still be useful.")
-            raise ValueError("OpenCode invocation failed; inspect logs before resuming")
-        if not state['session']:
-            raise ValueError("OpenCode emitted no session ID; inspect the raw log")
-        return facts
-
-    try:
-        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            handlers[sig] = signal.signal(sig, interrupt)
-        atomic_write(run / 'CONTROL.md', 'Work continuously towards the original task.\n')
-        with (run / (state['execution'] + '-server.log')).open('xb', buffering=0) as log:
-            with guarded([binary, 'serve', '--hostname', '127.0.0.1', '--port', '0'], log, leases=leases) as proc:
-                server.connect(Path(log.name), proc, tick)
-                if args.command == 'resume' and state['session']:
-                    native = server.request(f"session/{state['session']}")
-                    journal(run, 'session_reconciled', session=state['session'], native=native)
-                    for item in server.request(f"session/{state['session']}/inbox")['data']:
-                        if item['id'].startswith(control_prefix):
-                            server.request(f"session/{state['session']}/inbox/{item['id']}", method='DELETE')
-                            journal(run, 'stale_control_cancelled', message=item['id'])
-                common = (f"ORIGINAL TASK:\n{read(run / 'task.txt')}\nPROJECT: {Path.cwd()}\n" + SAFETY +
-                          ("Push is permitted only after checks and privacy review.\n" if args.push else "Do not git push.\n") +
-                          f"CONTROL FILE: {run / 'CONTROL.md'}\n" +
-                          f"Working budget ends at Unix time {time.time() + max(0, args.duration-(time.monotonic()-start)):.3f}.\n")
-                prompt = (common + "Work continuously until the task is complete, genuinely blocked, or stopped. "
-                          "Manage milestones yourself; ordinary progress needs no review or authorisation. "
-                          "Read CONTROL.md before substantial new work and at natural checkpoints. "
-                          "At STOP or budget end finish the active action safely and hand off. Do not invent work to fill time.\n" + RESULT)
-                if args.command == 'resume':
-                    prompt += ("RECOVERY: inspect prior logs, files, native session and active jobs first. "
-                               "Do not repeat non-idempotent actions whose result is uncertain.\n" +
-                               excerpt(json.dumps(state['incidents'][-12:])) + "\n" + excerpt(state.get('last_work', '')))
-                work = call('work', STOP + common if stopped else prompt)
-                if stopped and 'OC_RUN_RESULT ' not in work['text']:
-                    work = call('handoff', common + STOP)
-                result = work['text'].rsplit('OC_RUN_RESULT ', 1)
-                report = final_report(result[-1]) if len(result) == 2 else None
-                if report is None:
-                    raise ValueError("final result missing or invalid; useful work preserved, completion unverified")
-                state['review'] = report
-                if report['complete'] and (not report['evidence'] or not state['successful_tools']):
-                    report.update(complete=False, reason="Completion lacks observed supporting tool evidence; unverified.")
-                state.update(status='stopped' if stopped else 'reported-complete' if report['complete'] else 'incomplete',
-                             reason=state['reason'] if stopped else report['reason'])
-                code = 0 if report['complete'] and not stopped else 3
-    except KeyboardInterrupt as exc:
-        code = 128 + (exc.args[0] if exc.args else signal.SIGINT)
-        state.update(status='forced' if json.loads(read(run / 'force.json') or '{}').get('execution') == state['execution'] else 'interrupted',
-                     reason="Stopped by signal; in-flight results and external side effects are unverified.")
-        incident(run, state, state['reason'])
-    except (ValueError, OSError, subprocess.SubprocessError) as exc:
-        state.update(status="failed", reason=str(exc))
-    finally:
-        state['elapsed'] = prior + time.monotonic() - start
-        state['git_after'] = snapshot()
-        journal(run, 'finished', status=state['status'], exit=code)
-        save(run, state)
-        for sig, handler in handlers.items():
-            signal.signal(sig, handler)
-        owner.close()
-    label = state['status']
-    if sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get('TERM') != 'dumb':
-        colour = '32' if code == 0 else '33' if code == 3 or code >= 128 else '31'
-        label = f"\033[{colour}m{label}\033[0m"
-    print(f"oc-run: {label}; exit={code}; handoff {run / 'HANDOFF.md'}")
-    return code
-
-
-def main(argv=None):
-    os.umask(0o077)
-    argv = list(sys.argv[1:] if argv is None else argv)
-    root = Path(os.environ.get("OC_RUN_STATE_DIR", "~/.local/state/oc-run")).expanduser().absolute()
-    if argv and argv[0] == "_child":
-        return child_guard(int(argv[1]), argv[2:])
-    command = argv.pop(0) if argv and argv[0] in ('handoff', 'resume', 'status', 'stop') else 'run'
-    parser = argparse.ArgumentParser(prog="oc-run" + (" " + command if command != 'run' else ''),
-                                     description="Continuous OpenCode work with cooperative stop and a durable local handoff.")
-    if command in ('run', 'resume'):
-        parser.add_argument("duration", type=duration, help="working budget: 30m, 10h (bare numbers are minutes)")
-        if command == 'run':
-            parser.add_argument("task", nargs="+", help="original task")
-        parser.add_argument("--dry-run", action="store_true", help="show intent without running commands or writing state")
-        parser.add_argument("--project-root", type=Path, help="required workspace root outside Git repositories")
-        parser.add_argument("--push", action="store_true", help="permit reviewed, ordinary Git pushes")
-    if command in ('handoff', 'resume', 'status', 'stop'):
-        group = parser.add_mutually_exclusive_group(required=command != "status")
-        group.add_argument("--latest", action="store_true")
-        group.add_argument("--run", type=Path, help="recorded run directory")
-    if command == "stop":
-        parser.add_argument("--force", action="store_true", help="interrupt and clean the active invocation")
-    args = parser.parse_args(argv)
-    args.command = command
-    if command == 'run' and not ' '.join(args.task).strip():
-        raise ValueError("task must not be empty")
-    if command in ('run', 'resume') and args.dry_run:
-        print(f"Project: {Path.cwd()}\nBudget: {args.duration:.1f}s; no invocation timeout.\n"
-              f"Push permitted: {args.push}. No commands executed or state created.")
-        return 0
-    run = (args.run.expanduser().absolute() if args.run else latest(root, historical=command == 'handoff')) if command != 'run' else None
-    if run and (run.is_symlink() or not run.is_dir()):
-        raise ValueError('unknown run or symlink run directory')
-    if run:
-        info = run.lstat()
-        if info.st_uid != os.getuid() or info.st_mode & 0o077:
-            raise ValueError('run must be an owned private directory (0700)')
-    if command in ('status', 'stop'):
-        return control(run, command, getattr(args, 'force', False))
-    if command == 'handoff':
-        if (run / 'run.json').exists() or (run / 'run.json').is_symlink():
-            data = load_state(run)
-            print(handoff(run, data))
-            if data['status'] == 'running':
-                print("No final record: this run may be active or crashed. Inspect processes before resuming.")
-        else:
-            # Historical reports are read-only. Never promote their rejected checkpoints.
-            print("Legacy run: completion unverified. Inspect raw logs and validation records.\n")
-            print(read(run / 'RESULT.txt'))
-            print(excerpt(read(run / 'STATE.md')))
-            candidate = read(run / 'final.log.unverified-state')
-            if candidate:
-                print("\nUNVERIFIED final candidate excerpt (not accepted by the old controller):\n")
-                print(candidate[-4000:])
-            print(f"Full state and unverified candidates: {run}")
-        return 0
-    binary = os.environ.get('OC_RUN_BIN') or shutil.which('opencode')
-    if not binary:
-        raise ValueError("opencode not found on PATH")
-    project_root = git('rev-parse', '--show-toplevel')
-    if project_root:
-        workspace = Path(project_root).resolve()
-        identity = git('rev-parse', '--path-format=absolute', '--git-common-dir') or str(workspace)
-    else:
-        if args.project_root is None:
-            raise ValueError("non-Git workspaces require --project-root PATH")
-        workspace = args.project_root.expanduser().resolve()
-        if not workspace.is_dir() or not Path.cwd().is_relative_to(workspace):
-            raise ValueError("--project-root must be a directory containing the working directory")
-        identity = str(workspace)
-    if root.resolve().is_relative_to(workspace):
-        raise ValueError("keep private run state outside the project workspace")
-    root.mkdir(parents=True, mode=0o700, exist_ok=True)
-    info = root.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise ValueError("state root must be an owned private directory (0700), not a symlink")
-    key = hashlib.sha256(os.fsencode(os.path.realpath(identity))).hexdigest()
-    fd = os.open(root / ('repo-' + key + '.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, 'a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise ValueError("another oc-run owns this project")
-        return execute(args, binary, root, run, lock.fileno())
-
-
-if __name__ == '__main__':
-    try:
-        sys.exit(main())
-    except (ValueError, OSError, subprocess.SubprocessError) as error:
-        print(f"oc-run: {error}", file=sys.stderr)
-        sys.exit(2)
+if __name__ == "__main__":
+    sys.exit(main())
