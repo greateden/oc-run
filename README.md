@@ -35,12 +35,13 @@ Raw model output goes to these files, not the terminal. While a turn is running:
 tail -f /printed/log/directory/0001.stdout.jsonl /printed/log/directory/0001.stderr.log
 ```
 
-Ctrl-C stops further continuation and forwards **one** SIGINT to the owned
-OpenCode CLI, then waits for native interruption to settle. Repeated Ctrl-C does
-not force-kill it. Logs and completed work remain; inspect unfinished tools
-before resuming. Unrelated processes are never signalled. Exit codes: 0 for
-budget exhaustion, 130 for Ctrl-C, 2 for invalid arguments, non-zero for execution
-failure or the rapid-turn safeguard. OpenCode may perform its own provider retries.
+Ctrl-C, SIGHUP and SIGTERM stop further continuation and forward one matching
+signal to the owned OpenCode CLI, then wait for native interruption to settle.
+Repeated interrupts do not force-kill it. Logs and completed work remain;
+inspect unfinished tools before resuming. Unrelated processes are never signalled.
+Exit codes: 0 for budget exhaustion, 130 for Ctrl-C, 129 for SIGHUP, 143 for
+SIGTERM, 2 for invalid arguments, non-zero for execution failure or the rapid-turn
+safeguard. OpenCode may perform its own provider retries.
 
 From the original project directory, use the printed ID:
 

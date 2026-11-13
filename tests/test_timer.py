@@ -150,6 +150,26 @@ class Timer(unittest.TestCase):
                          self.calls()[0][self.calls()[0].index('--session') + 1])
         self.assertIn('interrupted natively', (self.logs() / '0001.stderr.log').read_text())
 
+    def test_hangup_preserves_logs_and_work(self):
+        proc = subprocess.Popen([sys.executable, str(WRAPPER), '10s', 'Original task'],
+                                env={**self.env, 'FIXTURE_MODE': 'interrupt'},
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            until = time.monotonic() + 5
+            while not (self.root / 'ready').exists() and time.monotonic() < until:
+                time.sleep(.01)
+            self.assertTrue((self.root / 'ready').exists())
+            proc.send_signal(signal.SIGHUP)
+            out, err = proc.communicate(timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.assertEqual(proc.returncode, 129, out + err)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual((self.root / 'work.txt').read_text(), 'preserved')
+        self.assertIn('interrupted natively', (self.logs() / '0001.stderr.log').read_text())
+
     def test_wall_clock_does_not_control_deadline(self):
         logdir = self.root / 'direct'
         logdir.mkdir()

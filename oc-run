@@ -87,7 +87,7 @@ def run(seconds, prompt, executable, logdir):
             forward_interrupt()
             note("Stop requested; waiting for native OpenCode to settle. No more turns.")
 
-        handlers = {s: signal.signal(s, interrupt) for s in (signal.SIGINT, signal.SIGTERM)}
+        handlers = {s: signal.signal(s, interrupt) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)}
         note(f"Logs: {logdir}")
         note(f"Directory: {Path.cwd()}; budget: {seconds:g}s")
         note(f"Session: {session} (OpenCode creates it on first invocation)")
