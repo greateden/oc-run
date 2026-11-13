@@ -1,171 +1,125 @@
-# OC Run
+# Use OpenCode directly
 
-Give [OpenCode](https://opencode.ai/) a task and a working budget.
-Let it work continuously. Check progress, request a safe stop, then resume later.
+`oc-run` is retired. There is no replacement controller or compatibility command.
+OpenCode already supplies non-interactive execution, project agents, tools,
+context compaction, persisted sessions and transcripts. Scientific completion
+belongs to the research deliverables. See [RELIABILITY.md](RELIABILITY.md) for the
+investigation and validation.
 
-A small Python controller for long coding and research tasks.
-One worker. No milestone review calls.
+## Start a Romansh session
 
-```mermaid
-flowchart TD
-    U["User controls<br/>start · status · stop · resume"] --> C["OC Run"]
-    C --> W["Worker: OpenCode<br/>One continuous session"]
-    W --> J[("Private event journal<br/>Raw events + control decisions")]
-    C --> J
-    W --> O["Event observer<br/>Warn on repeated identical failures"]
-    O -. "Steer at the next step boundary" .-> W
-    S["Independent model supervisor<br/>Not shipped: concurrency unverified"]
-    classDef work fill:#d7f0df,stroke:#24613b,color:#123820
-    classDef control fill:#deebf7,stroke:#365c85,color:#18334d
-    classDef caution fill:#fff0c2,stroke:#8a6400,color:#493600
-    class W,J work
-    class U,C control
-    class O,S caution
-    style S stroke-dasharray: 5 5
-```
+These commands use the installed CLI **2.0.28** and the existing project agent.
+`--standalone` avoids attaching that CLI to the separately installed Desktop
+service (observed running 2.2.7). It does not isolate model memory or files.
+The model, context capacity and KV settings are unchanged.
 
-The observer uses tool outcomes, not private reasoning or model calls.
-Independent model supervision is not included.
-
-## Quick start
-
-Needs macOS or Linux, Python 3.10+, Git and a configured OpenCode provider.
-Tested with OpenCode 2.0.28's native V2 APIs.
-
-Inspect this checkout, then install the local executable:
+Paste into a macOS terminal:
 
 ```sh
-mkdir -p ~/.local/bin
-install -m 755 oc-run ~/.local/bin/oc-run
+cd ~/Projects/Automatic-Subtitling-for-Romansh-TV
+umask 077
+research_log=$(mktemp -d "$HOME/.local/state/opencode/research-XXXXXXXX")
+research_deadline=$(date -u -v+15M '+%Y-%m-%dT%H:%M:%SZ')
+printf 'Logs=%s; advisory deadline=%s\n' "$research_log" "$research_deadline"
+opencode run --standalone --agent sage-research --format json --print-logs \
+  "Direct OpenCode session: no external controller or oc-run reporting contract applies. Work towards a soft deadline of $research_deadline. Check the time at natural boundaries; finish the active action safely and preserve results. Review the saved German-to-Romansh evaluation evidence and identify the next smallest authorised experiment. Reuse saved predictions; do not run training or translation batches. Follow the existing project research instructions." \
+  > "$research_log/stdout.jsonl" 2> "$research_log/stderr.log"
+research_exit=$?
+printf '%s\n' "$research_exit" > "$research_log/exit-status"
+printf 'OpenCode exit=%s; logs=%s\n' "$research_exit" "$research_log"
 ```
 
-Keep `~/.local/bin` on your PATH. Back up any old installation. In your project:
+The parent state directory already exists on this installation. If using this
+recipe elsewhere, create it first with `mkdir -p ~/.local/state/opencode`.
+Replace the research objective in the prompt when needed. Native permissions
+still apply; no extra auto-approval flag is added.
+
+**The deadline is advisory.** There is no external timer, timed steering request,
+forced termination or promise of 15-minute execution. The model can finish early,
+overrun or fail to check the clock. For a longer session, change `-v+15M` to
+`-v+10H` and supply the intended research objective. Keep a terminal open; this
+recipe does not provide unattended terminal-disconnection survival.
+
+## Monitor, interrupt and resume
+
+In another terminal, use the printed log directory:
 
 ```sh
-oc-run 10h "Research and improve this project"
+tail -f /path/printed/above/stdout.jsonl /path/printed/above/stderr.log
 ```
 
-Your model, tools and permissions stay configured as before.
-The budget requests a handoff. No fixed rounds or silence timeouts.
-It is a cooperative working deadline, not a hard wall-clock kill: an active action
-can overrun it. No provider recovery starts after stop or budget end.
+Ctrl-C in the launching terminal interrupts native execution. It is not a safe
+checkpoint request. Completed output remains in the logs and native session;
+in-flight tools or external effects need inspection. Closing the terminal may
+also prevent the shell from writing `exit-status`.
 
-## Commands
+From the same project directory, list sessions and choose the explicit ID:
 
 ```sh
-oc-run status
-oc-run stop --latest          # request a safe handoff; return promptly
-oc-run stop --latest --force  # interrupt the active invocation
-oc-run handoff --latest
-oc-run resume 2h --latest     # inspect interrupted work; give a new budget
+opencode session list --standalone --max-count 10
+opencode session export --standalone SESSION_ID > "$research_log/session.json"
+opencode --standalone --session SESSION_ID
 ```
 
-- `--run /path/to/run` selects a recorded run explicitly.
-- Controls select only the current directory's active run, then its newest.
-- `handoff --latest` also allows historical runs from other directories.
-- `--dry-run` shows intent without starting OpenCode or creating state.
-- Non-Git workspaces require `--project-root /path/to/project` on start and resume.
-  Use the same root from nested directories. Controls still select runs by working directory.
-- `--push` permits checked, reviewed pushes. Off by default.
-- Durations: `s`, `m`, `h`. Bare numbers mean minutes.
-- Reported completion stops by default.
-
-Soft stop saves the request and uses OpenCode's native steering inbox.
-`status` shows pending, confirmed, rejected or uncertain admission. Confirmed means
-accepted by OpenCode; delivery waits for a step boundary. Unknown outcomes are
-reconciled before retrying the same message ID. `CONTROL.md` is the fallback.
-There is no automatic escalation. Resume starts a new budget and clears stale steering.
-
-Force stop, Ctrl-C, SIGTERM and terminal closure interrupt work.
-Cleanup sends TERM, then KILL to managed process groups. Other OpenCode services
-are untouched. `status` distinguishes stopping, stopped and interrupted runs.
-
-## Recovery and safety
-
-Private state lives in `~/.local/state/oc-run`, outside your project:
-
-| File | Purpose |
-| --- | --- |
-| `HANDOFF.md` | Short account of work, failures, uncertainty and next steps |
-| `run.json` | Small control snapshot, session ID and recent excerpts |
-| `*-work.jsonl` | Incremental native OpenCode events |
-| `journal.jsonl` | Session identity, requests, warnings and state transitions |
-
-Raw logs remain complete. Parsing skips records above 1 MiB and continues at the
-next newline. Summaries retain the last 65,536 text characters, 32 recent facts per kind
-and updates for 256 recent tool calls. Older call updates may count separately;
-inspect raw logs when a summary is limited. Invocation Markdown files are excerpts.
-Oversized old snapshots remain readable. Resume preserves the original in `legacy-state.json` before compacting it.
-
-Keep logs private: they may contain secrets. `OC_RUN_STATE_DIR` selects another
-private directory outside the Git or declared non-Git workspace, including resolved
-symlink paths. Locks prevent overlapping workers using the same workspace identity
-and state directory. Git uses its common directory. Non-Git roots are explicit;
-separately declared overlapping roots cannot be detected. Unrelated roots remain independent.
-
-After a crash, resume preserves partial logs, reconstructs complete events and
-checks OpenCode's persisted session. The worker must inspect files, jobs and
-uncertain side effects before repeating non-idempotent actions. Legacy handoffs
-remain readable.
-
-After a terminal provider transport/timeout error, or the specific Sage prefill
-OOM reporting that caches were cleared and the engine remains up, OC Run permits
-at most two extra invocations per start/resume (2s then 4s backoff). OpenCode has its
-own bounded request retries before this. Persistent OOMs can still fail.
-
-Recovery continues the original session only after native checks find no active
-session, child session, queued input or managed shell. Missing native state,
-uncertain/timed-out tools and other errors stop with a diagnostic. Child sessions
-conservatively require manual inspection. There is no blind new-session fallback.
-The worker must inspect saved results and jobs before continuing; completed tools
-are never replayed by the controller.
-
-A missing or malformed `OC_RUN_RESULT` gets one handoff-only repair opportunity,
-sharing the same two-invocation recovery allowance. Each handoff invocation is
-limited to 120s. It requests no tools or experiments and may report incomplete.
-If repair fails, `HANDOFF.md` still records observed tool counts, errors, Git state,
-session identity and raw-log paths; it never invents a research result.
-
-The completion contract requires `decision: STOP`, boolean `complete`, non-empty
-`reason`, `summary`, `next`, and a string-list `evidence`. A complete claim also
-requires cited evidence and an observed successful tool. Exit 0 alone never meets
-this contract. Tool errors stay historical and do not automatically fail a session;
-shell timeout/signal/background metadata is not counted as completed evidence.
-
-No agent or model flag is passed: OpenCode resolves project configuration and
-preserves session selection on resume. Context limits, BF16 and KV precision are
-unchanged. Research scheduling and memory headroom remain the agent's responsibility.
-
-Raw logs use `fsync` on useful events and roughly one-second polling boundaries.
-Control records are synced; atomic snapshots also sync their parent directory.
-This requests filesystem durability, not guaranteed power-loss recovery.
-Unsynced tokens and unrecorded effects may be lost. No physical reboot was tested.
-
-## Limits and checks
-
-- Four identical consecutive failures trigger one warning per invocation.
-  Changed inputs or successful tools break the streak. Warnings never kill work.
-- No reasoning-loop, drift or overengineering judgement. Only the bounded,
-  checked recovery above is automatic; unknown process/provider errors stop.
-- OpenCode 2.0.28 omits child-session events from the parent's CLI stream.
-  Child tool failures and progress may be absent; inspect native sessions before recovery.
-- Stop and Git rules are cooperative, not a sandbox. Detached jobs can escape
-  cleanup and native recovery checks. Handoff-only instructions are also cooperative.
-  Private-server teardown can terminate its own managed jobs. Unrelated process
-  groups are untouched. Other OpenCode versions may change APIs or events.
-- Exit `0`: model-reported completion with evidence and successful tools, not
-  independent proof. Run your own acceptance checks. `3`: stopped/incomplete.
-  `1`: invocation/report failure.
-  `2`: setup error. Signals: `128 + signal`.
-
-Run deterministic tests without a model:
+The last command opens the native interactive interface for inspection. To
+continue non-interactively, use fresh stdout/stderr logs as above and a new
+advisory deadline in the prompt:
 
 ```sh
+opencode run --standalone --agent sage-research --session SESSION_ID \
+  --format json --print-logs \
+  "Direct OpenCode session: no external controller or oc-run contract applies. Inspect saved outputs and active jobs first; do not duplicate uncertain actions. Continue the authorised task."
+```
+
+Use an explicit session ID rather than whichever session happens to be latest.
+Old controller run IDs are not native session IDs; read the `Session:` line in
+an old `HANDOFF.md` or the `session` field of its `run.json`. Inspect historical
+instructions and queued input before resuming an old session.
+
+## Failure behaviour
+
+- No final answer: retain the transcript; do not launch a repair request or
+  infer that the research succeeded. The native CLI can exit 0 with no answer.
+- Tool failure: the agent may continue; failed tool details remain in the native
+  transcript. A process exit of 0 does not validate scientific results.
+- Provider OOM: preserve the native error and actual exit status. No external
+  retry, automatic resumption or model-setting change. Inspect memory, outputs
+  and jobs before deciding whether to resume. OpenCode may retry some provider
+  errors internally; this repository adds no retry policy.
+- Long experiments: there is no budget-triggered signal or process-group cleanup.
+  A deliberately detached fixture survived native CLI exit. Native managed jobs
+  can have different lifetimes; do not assume private-server shutdown preserves
+  them. Follow the agent's existing bounded-job and persistent-log instructions.
+- No wrapper lock: do not start competing research sessions in the same checkout.
+  OpenCode sessions do not serialise writes from separate sessions. Use an
+  isolated worktree if concurrent work is necessary; keep heavy experiments
+  sequential under the existing agent policy.
+
+## Checks and rollback
+
+No dependencies beyond Python's standard library and the installed OpenCode:
+
+```sh
+OC_NATIVE_BIN="$HOME/.opencode/bin/opencode" \
+OC_NATIVE_AGENT="$HOME/Projects/Automatic-Subtitling-for-Romansh-TV/.opencode/agents/sage-research.md" \
 python3 -m unittest discover -s tests -v
 ```
 
-Set `OC_RUN_NATIVE_BIN` to the installed OpenCode executable to include native
-CLI/server/tool integration tests with a loopback fixture provider, without model
-inference. See [RELIABILITY.md](RELIABILITY.md) for the dated investigation and scope.
+These five native CLI tests use a loopback provider, not live Sage inference.
+The former controller is retained at Git reference `backup/pre-native-20261113`
+(commit `1c36a97`) and in an external Git bundle. Local installation and global
+instruction backups are in:
 
-MIT licence. See [LICENSE](LICENSE).
+```text
+~/.local/share/oc-run/retirement-20261113T113106Z/
+```
+
+For rollback, restore `oc-run.installed` to `~/.local/bin/oc-run` using
+`install -m 755`, and restore `global-AGENTS.md.before` only after comparing it
+with the current global instructions. To inspect the old source without changing
+this checkout, run `git worktree add --detach /a/new/path 1c36a97`.
+Historical `~/.local/state/oc-run/` directories remain untouched.
+
+Native command documentation: [CLI](https://opencode.ai/docs/cli/commands/).
+The installed `opencode run --help` is authoritative for this installation;
+the website also documents newer flags absent from 2.0.28.
